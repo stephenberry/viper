@@ -4,7 +4,7 @@ A minimal coding agent for the terminal, written in Rust. viper is modeled on [p
 
 ## Install
 
-Each [GitHub release](https://github.com/stephenberry/viper/releases) has prebuilt binaries: static Linux builds (x86_64 and arm64), a universal macOS build, and Windows (x86_64), with SHA-256 checksums in `SHA256SUMS`. Unpack the archive and put `viper` on your `PATH`.
+Each [GitHub release](https://github.com/stephenberry/viper/releases) has prebuilt binaries: static Linux builds (x86_64 and arm64), a universal macOS build, and Windows (x86_64), with SHA-256 checksums in `SHA256SUMS`. See [docs/install.md](docs/install.md) for step-by-step instructions for each platform and for setting up a model provider.
 
 To build from source (Rust 1.96 or newer):
 
