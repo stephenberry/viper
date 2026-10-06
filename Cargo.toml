@@ -1,0 +1,50 @@
+[package]
+name = "viper"
+version = "0.1.0"
+edition = "2024"
+description = "A minimal coding agent harness for the terminal"
+license = "MIT"
+rust-version = "1.96"
+
+[[bin]]
+name = "viper"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+arboard = { version = "3", default-features = false, features = ["image-data"] }
+async-trait = "0.1"
+base64 = "0.22"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+clap = { version = "4", features = ["derive"] }
+crossterm = { version = "0.29", features = ["event-stream", "bracketed-paste"] }
+dirs = "6"
+futures = "0.3"
+globset = "0.4"
+ignore = "0.4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+libc = "0.2"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+similar = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+unicode-segmentation = "1"
+unicode-width = "0.2"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.dev]
+incremental = false
+debug = "line-tables-only"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
