@@ -316,7 +316,7 @@ impl App {
         if stats.cost > 0.0 {
             right.push_str(&format!(" · ${:.2}", stats.cost));
         }
-        right.push_str(&format!(" · {}", model.id));
+        right.push_str(&format!(" · {}", self.agent.setup().registry.label(&model)));
         if !model.thinking_levels.is_empty() {
             right.push_str(&format!(" · {thinking}"));
         }
@@ -1133,7 +1133,9 @@ impl App {
     /// `/autocompact [<size>|auto|off|on]`: change when auto-compaction runs for the current
     /// model, saving the choice to the global settings like Claude Code does.
     fn autocompact(&mut self, args: &str) {
-        let key = self.agent.model().key();
+        let model = self.agent.model();
+        let key = model.key();
+        let label = self.agent.setup().registry.label(&model);
         let arg = args.trim().to_ascii_lowercase();
         let saved = match arg.as_str() {
             "" => Ok(()),
@@ -1169,13 +1171,13 @@ impl App {
         } else {
             match snapshot.auto_compact_window {
                 Some(window) if window > snapshot.compaction_threshold => format!(
-                    "Auto-compaction runs at {threshold} tokens for {key} ({} requested; capped by the model's {} window).",
+                    "Auto-compaction runs at {threshold} tokens for {label} ({} requested; capped by the model's {} window).",
                     format_tokens(window),
                     format_tokens(snapshot.model.context_window)
                 ),
-                Some(_) => format!("Auto-compaction runs at {threshold} tokens for {key}."),
+                Some(_) => format!("Auto-compaction runs at {threshold} tokens for {label}."),
                 None => format!(
-                    "Auto-compaction runs at {threshold} tokens for {key} (auto: the {} window minus room for the response).",
+                    "Auto-compaction runs at {threshold} tokens for {label} (auto: the {} window minus room for the response).",
                     format_tokens(snapshot.model.context_window)
                 ),
             }
@@ -1230,13 +1232,14 @@ impl App {
 
     fn apply_model(&mut self, model: crate::config::Model, save: bool) -> Result<()> {
         let key = model.key();
+        let label = self.agent.setup().registry.label(&model);
         self.agent.set_model(model)?;
         if save {
             Settings::save_global(|map| {
                 map.insert("defaultModel".into(), Value::String(key.clone()));
             })?;
         }
-        self.notice(&format!("Model: {key}{}", if save { " (saved as default)" } else { "" }));
+        self.notice(&format!("Model: {label}{}", if save { " (saved as default)" } else { "" }));
         self.refresh_footer();
         Ok(())
     }
@@ -1248,16 +1251,19 @@ impl App {
         let available: Vec<&crate::config::Model> = registry.available();
         let models: Vec<crate::config::Model> =
             if available.is_empty() { registry.all().to_vec() } else { available.into_iter().cloned().collect() };
+        // Names in one column, then provider and window; the full id stays searchable.
+        let width = models.iter().map(|m| visible_width(&m.name)).max().unwrap_or(0).min(40);
         let items = models
             .iter()
             .map(|m| Item {
-                label: m.key(),
+                label: format!("{:<width$}", m.name),
                 detail: format!(
-                    "{} · {}k ctx{}",
-                    m.name,
-                    m.context_window / 1000,
+                    "{} · {} ctx{}",
+                    m.provider,
+                    format_tokens(m.context_window),
                     if has_credentials(m) { "" } else { " · no credentials" }
                 ),
+                keywords: m.key(),
             })
             .collect();
         let initial = models.iter().position(|m| m.key() == current).unwrap_or(0);
@@ -1279,7 +1285,7 @@ impl App {
             return;
         }
         let levels = model.thinking_levels.clone();
-        let items = levels.iter().map(|l| Item { label: l.to_string(), detail: String::new() }).collect();
+        let items = levels.iter().map(|l| Item { label: l.to_string(), ..Default::default() }).collect();
         let initial = levels.iter().position(|l| *l == self.agent.thinking()).unwrap_or(0);
         self.overlay = Some(Overlay::Thinking(
             Selector::new("Thinking level", items, initial, "enter use · ctrl+s use and save as default · esc cancel"),
@@ -1348,10 +1354,10 @@ impl App {
         let setup = self.agent.setup();
         let model = self.agent.model();
         let mut lines = vec![Line::plain(format!(
-            "{BOLD}{CYAN}viper{RESET} {GRAY}v{}{RESET}  {} {GRAY}({}){RESET}",
+            "{BOLD}{CYAN}viper{RESET} {GRAY}v{}{RESET}  {} {GRAY}· {}{RESET}",
             env!("CARGO_PKG_VERSION"),
             model.name,
-            model.key()
+            model.provider
         ))];
         if !setup.context_files.is_empty() {
             let files: Vec<String> = setup.context_files.iter().map(|f| crate::util::tildify(&f.path)).collect();
@@ -1379,6 +1385,7 @@ fn session_item(summary: &crate::session::SessionSummary) -> Item {
     Item {
         label: truncate(&sanitize(&title), 60),
         detail: format!("{} · {} messages", relative_time(summary.modified), summary.message_count),
+        ..Default::default()
     }
 }
 

@@ -5,10 +5,12 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use super::style::*;
 use super::text::truncate;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Item {
     pub label: String,
     pub detail: String,
+    /// Extra text the filter matches but the list does not show.
+    pub keywords: String,
 }
 
 pub enum SelectAction {
@@ -56,7 +58,8 @@ impl Selector {
         let terms: Vec<String> = self.filter.to_lowercase().split_whitespace().map(str::to_string).collect();
         self.visible = (0..self.items.len())
             .filter(|i| {
-                let hay = format!("{} {}", self.items[*i].label, self.items[*i].detail).to_lowercase();
+                let item = &self.items[*i];
+                let hay = format!("{} {} {}", item.label, item.detail, item.keywords).to_lowercase();
                 terms.iter().all(|t| hay.contains(t))
             })
             .collect();

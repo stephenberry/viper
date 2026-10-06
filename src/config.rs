@@ -659,6 +659,20 @@ fn builtin(id: &str) -> Option<&'static BuiltinModel> {
     BUILTIN_ANTHROPIC.iter().find(|model| model.id == id)
 }
 
+/// A readable default name for a gateway model id: its last path segment without leading dotted
+/// routing segments (a region or vendor, which contain no digits). For example
+/// `gateway/us.amazon.nova-pro-v1:0` becomes `nova-pro-v1:0`.
+fn short_model_name(id: &str) -> String {
+    let mut name = id.rsplit('/').next().unwrap_or(id);
+    while let Some((prefix, rest)) = name.split_once('.')
+        && !rest.is_empty()
+        && prefix.chars().all(|c| c.is_ascii_alphabetic() || c == '-' || c == '_')
+    {
+        name = rest;
+    }
+    if name.is_empty() { id.to_string() } else { name.to_string() }
+}
+
 /// The built-in model a gateway model id refers to: the id itself, its last path segment
 /// (`anthropic/claude-opus-5-5`), or its last dotted segment (Bedrock's
 /// `us.anthropic.claude-opus-5-5`).
@@ -745,7 +759,7 @@ fn resolve_custom_model(provider_name: &str, provider: &ProviderConfig, config: 
             .name
             .clone()
             .or_else(|| inherited.map(|b| b.name.to_string()))
-            .unwrap_or_else(|| config.id.clone()),
+            .unwrap_or_else(|| short_model_name(&config.id)),
         api,
         base_url,
         api_key: provider.api_key.as_deref().map(ConfigValue::parse),
@@ -859,6 +873,13 @@ impl ModelRegistry {
                 bail!("'{query}' matches several models: {}", names.join(", "))
             }
         }
+    }
+
+    /// Short label for display: the model's name, plus its provider when another usable model
+    /// has the same name.
+    pub fn label(&self, model: &Model) -> String {
+        let shared = self.available().iter().any(|other| other.name == model.name && other.key() != model.key());
+        if shared { format!("{} ({})", model.name, model.provider) } else { model.name.clone() }
     }
 
     /// The model for a new session: settings default, else the first model with credentials.
@@ -978,6 +999,28 @@ mod tests {
         assert!(parse_auto_compact_window("50k").is_err());
         assert!(parse_auto_compact_window("2M").is_err());
         assert!(parse_auto_compact_window("lots").is_err());
+    }
+
+    #[test]
+    fn short_names_drop_routing_prefixes() {
+        assert_eq!(short_model_name("us.amazon.nova-pro-v1:0"), "nova-pro-v1:0");
+        assert_eq!(short_model_name("gateway/openai.gpt-5.6-terra"), "gpt-5.6-terra");
+        assert_eq!(short_model_name("eu-west.xai.grok-4.6"), "grok-4.6");
+        assert_eq!(short_model_name("gpt-oss-120b"), "gpt-oss-120b");
+        assert_eq!(short_model_name("llama3.3-70b"), "llama3.3-70b");
+    }
+
+    #[test]
+    fn labels_add_the_provider_only_for_shared_names() {
+        let builtin = builtin_anthropic_models().into_iter().find(|m| m.id == "claude-opus-5-5").unwrap();
+        let key = Some(ConfigValue::Literal("key".into()));
+        let direct = Model { provider: "direct".into(), api_key: key.clone(), ..builtin.clone() };
+        let gateway = Model { provider: "gateway".into(), api_key: key, ..builtin.clone() };
+        let unusable = Model { provider: "other".into(), api_key: None, ..builtin };
+        let registry = ModelRegistry::from_models(vec![direct.clone(), unusable.clone()]);
+        assert_eq!(registry.label(&direct), "Claude Opus 5.5");
+        let registry = ModelRegistry::from_models(vec![direct.clone(), gateway, unusable]);
+        assert_eq!(registry.label(&direct), "Claude Opus 5.5 (direct)");
     }
 
     #[test]
