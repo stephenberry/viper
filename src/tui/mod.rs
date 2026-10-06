@@ -1372,9 +1372,8 @@ impl App {
         for problem in problems {
             lines.push(Line::indented(paint(YELLOW, &format!("warning: {problem}")), "", "  "));
         }
-        lines.push(Line::plain(dim(
-            "esc interrupt · ctrl+c clear/exit · shift+tab thinking · ctrl+l model · /help commands · /hotkeys",
-        )));
+        lines
+            .push(Line::plain(dim("esc interrupt · ctrl+c clear/exit · shift+tab thinking · ctrl+l model · /hotkeys")));
         self.commit(lines);
     }
 }
