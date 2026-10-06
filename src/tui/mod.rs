@@ -96,8 +96,9 @@ struct RunningTool {
     output: String,
 }
 
+/// An open selector and the values its items stand for, in display order.
 enum Overlay {
-    Model(Selector),
+    Model(Selector, Vec<crate::config::Model>),
     Thinking(Selector, Vec<ThinkingLevel>),
     Session(Selector, Vec<PathBuf>),
 }
@@ -449,7 +450,7 @@ impl App {
         if let Some(overlay) = &self.overlay {
             lines.push(border.clone());
             let selector = match overlay {
-                Overlay::Model(s) | Overlay::Thinking(s, _) | Overlay::Session(s, _) => s,
+                Overlay::Model(s, _) | Overlay::Thinking(s, _) | Overlay::Session(s, _) => s,
             };
             lines.extend(selector.render(width));
             lines.push(border);
@@ -724,11 +725,16 @@ impl App {
     async fn on_terminal(&mut self, event: Event) -> Result<()> {
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
-                if self.overlay.is_some() {
-                    self.on_overlay_key(key)?;
+                let result = if self.overlay.is_some() {
+                    self.on_overlay_key(key)
                 } else {
                     self.notice = None;
-                    self.on_key(key).await?;
+                    self.on_key(key).await
+                };
+                // A failed action (switching models, saving settings, ...) is reported and the
+                // session continues; terminal failures surface from drawing instead.
+                if let Err(err) = result {
+                    self.error(&format!("{err:#}"));
                 }
             }
             Event::Paste(text) => {
@@ -1240,8 +1246,8 @@ impl App {
         // Models without credentials are listed only when nothing is usable, to explain why.
         let registry = &self.agent.setup().registry;
         let available: Vec<&crate::config::Model> = registry.available();
-        let models: Vec<&crate::config::Model> =
-            if available.is_empty() { registry.all().iter().collect() } else { available };
+        let models: Vec<crate::config::Model> =
+            if available.is_empty() { registry.all().to_vec() } else { available.into_iter().cloned().collect() };
         let items = models
             .iter()
             .map(|m| Item {
@@ -1255,12 +1261,15 @@ impl App {
             })
             .collect();
         let initial = models.iter().position(|m| m.key() == current).unwrap_or(0);
-        self.overlay = Some(Overlay::Model(Selector::new(
-            "Model",
-            items,
-            initial,
-            "↑↓ select · enter use · ctrl+s use and save as default · esc cancel",
-        )));
+        self.overlay = Some(Overlay::Model(
+            Selector::new(
+                "Model",
+                items,
+                initial,
+                "↑↓ select · enter use · ctrl+s use and save as default · esc cancel",
+            ),
+            models,
+        ));
     }
 
     fn open_thinking_selector(&mut self) {
@@ -1293,7 +1302,7 @@ impl App {
     fn on_overlay_key(&mut self, key: KeyEvent) -> Result<()> {
         let Some(overlay) = &mut self.overlay else { return Ok(()) };
         let selector = match overlay {
-            Overlay::Model(s) | Overlay::Thinking(s, _) | Overlay::Session(s, _) => s,
+            Overlay::Model(s, _) | Overlay::Thinking(s, _) | Overlay::Session(s, _) => s,
         };
         let (index, save) = match selector.handle_key(key) {
             SelectAction::None => return Ok(()),
@@ -1304,10 +1313,7 @@ impl App {
             SelectAction::Choose { index, save } => (index, save),
         };
         match self.overlay.take().expect("overlay checked above") {
-            Overlay::Model(_) => {
-                let model = self.agent.setup().registry.all()[index].clone();
-                self.apply_model(model, save)?;
-            }
+            Overlay::Model(_, mut models) => self.apply_model(models.swap_remove(index), save)?,
             Overlay::Thinking(_, levels) => {
                 let applied = self.agent.set_thinking(levels[index])?;
                 if save {
