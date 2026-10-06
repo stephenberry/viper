@@ -1,0 +1,124 @@
+name: Release
+
+# Pushing a `v*` tag builds the binaries and publishes a GitHub release with them. Running the
+# workflow manually builds the binaries as workflow artifacts without publishing anything.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Check the version
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag matches the crate version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match version $version in Cargo.toml"
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: verify
+    # Runs after a successful check, or without it when started manually.
+    if: ${{ !failure() && !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Static binaries that run on any Linux distribution.
+          - name: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            targets: [x86_64-unknown-linux-musl]
+          - name: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            targets: [aarch64-unknown-linux-musl]
+          # One universal binary for Intel and Apple silicon, from a single (costly) macOS job.
+          - name: universal-apple-darwin
+            os: macos-latest
+            targets: [aarch64-apple-darwin, x86_64-apple-darwin]
+          - name: x86_64-pc-windows-msvc
+            os: windows-latest
+            targets: [x86_64-pc-windows-msvc]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ join(matrix.targets, ',') }}
+      - name: Install cross
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: Build
+        run: |
+          for target in ${{ join(matrix.targets, ' ') }}; do
+            if [ "$RUNNER_OS" = Linux ]; then
+              cross build --release --locked --target "$target"
+            else
+              cargo build --release --locked --target "$target"
+            fi
+          done
+      - name: Package
+        run: |
+          name="viper-${GITHUB_REF_NAME}-${{ matrix.name }}"
+          mkdir "$name"
+          cp README.md "$name/"
+          case "$RUNNER_OS" in
+            macOS)
+              lipo -create -output "$name/viper" \
+                target/aarch64-apple-darwin/release/viper target/x86_64-apple-darwin/release/viper
+              tar czf "$name.tar.gz" "$name"
+              ;;
+            Windows)
+              cp "target/${{ matrix.targets[0] }}/release/viper.exe" "$name/"
+              7z a "$name.zip" "$name"
+              ;;
+            *)
+              cp "target/${{ matrix.targets[0] }}/release/viper" "$name/"
+              tar czf "$name.tar.gz" "$name"
+              ;;
+          esac
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            viper-*.tar.gz
+            viper-*.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish the release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum viper-* > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" ./* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
