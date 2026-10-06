@@ -205,6 +205,9 @@ fn apply_auth(
         AuthHeader::XApiKey => builder.header("x-api-key", api_key),
         AuthHeader::Bearer => builder.bearer_auth(api_key),
     };
+    if model.api == Api::AnthropicMessages {
+        builder = builder.header("anthropic-version", anthropic::API_VERSION);
+    }
     for (name, value) in &model.headers {
         let value = value.resolve().map_err(|e| ProviderError::fatal(format!("header '{name}': {e:#}")))?;
         if let Some(value) = value {
@@ -212,6 +215,45 @@ fn apply_auth(
         }
     }
     Ok(builder)
+}
+
+/// Outcome of checking an API key with `check_credentials`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialCheck {
+    /// The server accepted the key and reported this many models.
+    Accepted(usize),
+    /// The server rejected the key (HTTP 401 or 403).
+    Rejected(String),
+    /// The key could not be checked: the server was unreachable or does not list models.
+    Unverified(String),
+}
+
+/// Check `api_key` against the model's server by listing its models (`GET /v1/models`, which
+/// Anthropic, OpenAI-compatible servers, and LiteLLM provide).
+pub async fn check_credentials(client: &reqwest::Client, model: &Model, api_key: &str) -> CredentialCheck {
+    let base = model.base_url.trim_end_matches('/');
+    let base = base.strip_suffix("/v1").unwrap_or(base);
+    let builder = client.get(format!("{base}/v1/models")).timeout(Duration::from_secs(20));
+    let builder = match apply_auth(builder, model, api_key) {
+        Ok(builder) => builder,
+        Err(err) => return CredentialCheck::Unverified(err.message),
+    };
+    let response = match builder.send().await {
+        Ok(response) => response,
+        Err(err) => return CredentialCheck::Unverified(format!("request failed: {}", error_chain(&err))),
+    };
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        let body = response.text().await.unwrap_or_default();
+        return CredentialCheck::Rejected(ProviderError::from_status(status, &body, None).message);
+    }
+    if !status.is_success() {
+        return CredentialCheck::Unverified(format!("listing models returned HTTP {status}"));
+    }
+    match response.json::<Value>().await {
+        Ok(body) => CredentialCheck::Accepted(body.get("data").and_then(Value::as_array).map_or(0, Vec::len)),
+        Err(err) => CredentialCheck::Unverified(format!("unexpected model list: {err}")),
+    }
 }
 
 fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {

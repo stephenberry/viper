@@ -218,13 +218,12 @@ fn handle(agent: &Agent, responder: &std::sync::Arc<Responder>, id: Option<Value
         Command::GetState => reply(Ok(Some(json!(agent.snapshot())))),
         Command::SetModel { provider, model_id } => reply(
             agent
-                .setup()
-                .registry
+                .registry()
                 .find(&format!("{provider}/{model_id}"))
                 .and_then(|model| agent.set_model(model.clone()).map(|_| Some(json!(model)))),
         ),
         Command::GetAvailableModels => {
-            let models: Vec<_> = agent.setup().registry.available().into_iter().cloned().collect();
+            let models: Vec<_> = agent.registry().available().into_iter().cloned().collect();
             reply(Ok(Some(json!({"models": models}))));
         }
         Command::SetThinkingLevel { level } => reply(agent.set_thinking(level).map(|l| Some(json!({"level": l})))),

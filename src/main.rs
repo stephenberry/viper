@@ -1,4 +1,5 @@
 mod agent;
+mod auth;
 mod cli;
 mod compaction;
 mod config;
@@ -143,7 +144,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     } else {
         None
     };
-    let (session, session_warnings) = match &session_path {
+    let (session, mut session_warnings) = match &session_path {
         Some(path) if persist => SessionStore::open(path)?,
         Some(_) => bail!("--no-session cannot be combined with resuming a session"),
         None => (SessionStore::create(&cwd, persist), Vec::new()),
@@ -161,8 +162,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             Some(model) => model,
             None => match registry.default_model(&settings) {
                 Ok(model) => model,
-                // An explicit key makes the first built-in model usable.
-                Err(_) if cli.api_key.is_some() => registry.all()[0].clone(),
+                // An explicit key makes the first built-in model usable; interactive mode starts
+                // without credentials so `/login` can add them.
+                Err(_) if cli.api_key.is_some() || interactive => registry.all()[0].clone(),
                 Err(err) => return Err(err),
             },
         },
@@ -171,7 +173,15 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         registry.set_api_key(&model.provider, ConfigValue::Literal(key.clone()));
         model.api_key = Some(ConfigValue::Literal(key.clone()));
     }
-    crate::config::ensure_credentials(&model)?;
+    if let Err(err) = crate::config::ensure_credentials(&model) {
+        if !interactive || cli.model.is_some() {
+            return Err(err);
+        }
+        session_warnings.push(format!(
+            "No API key is configured for {}. Use /login <provider> to add one, or /model to choose another model.",
+            model.provider
+        ));
+    }
     let thinking = cli
         .thinking
         .or_else(|| session.last_thinking_level())
@@ -210,9 +220,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     };
     let initial = initial_messages(&cli.messages, &cwd, stdin)?;
 
-    let setup = AgentSetup { cwd, settings, registry, tools, system_prompt, context_files, skills, skill_warnings };
+    let setup = AgentSetup { cwd, settings, tools, system_prompt, context_files, skills, skill_warnings };
     let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
-    let agent = Agent::new(setup, model, thinking, session, events_tx)?;
+    let agent = Agent::new(setup, registry, model, thinking, session, events_tx)?;
 
     match (cli.mode, cli.print) {
         (Mode::Rpc, _) => modes::rpc::run(agent, events_rx).await,

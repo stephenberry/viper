@@ -5,6 +5,7 @@
 
 mod editor;
 mod markdown;
+mod prompt;
 mod render;
 mod select;
 mod style;
@@ -23,11 +24,13 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::agent::{Agent, AgentEvent, Busy, CompactionReason, PromptDisposition, QueueMode};
-use crate::config::{Settings, ThinkingLevel, has_credentials, parse_auto_compact_window};
+use crate::auth::{AuthStore, auth_path};
+use crate::config::{Model, ModelRegistry, Settings, ThinkingLevel, has_credentials, parse_auto_compact_window};
 use crate::message::{BashExecutionMessage, ContentBlock, Message, StopReason};
-use crate::provider::StreamDelta;
+use crate::provider::{CredentialCheck, StreamDelta};
 use editor::Editor;
 use markdown::MarkdownRenderer;
+use prompt::{PromptAction, TextPrompt};
 use render::{Line, ToolState};
 use select::{Item, SelectAction, Selector};
 use style::*;
@@ -43,6 +46,7 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("name", "Name the session: /name <name>", true),
     ("compact", "Compact the context: /compact [focus]", false),
     ("autocompact", "Set when auto-compaction runs: /autocompact <size>|auto|off|on", false),
+    ("login", "Save a provider's base URL and API key: /login <provider>", true),
     ("copy", "Copy the last response to the clipboard", false),
     ("hotkeys", "Show keyboard shortcuts", false),
     ("help", "Show commands", false),
@@ -73,6 +77,7 @@ enum AppMsg {
     BashUpdate(String),
     BashDone(Result<BashExecutionMessage>),
     CompactDone(Result<()>),
+    LoginChecked(Box<CheckedLogin>),
 }
 
 enum StreamKind {
@@ -96,11 +101,36 @@ struct RunningTool {
     output: String,
 }
 
-/// An open selector and the values its items stand for, in display order.
+/// What replaces the editor while open: a selector and the values its items stand for, in
+/// display order, or the `/login` prompts.
 enum Overlay {
-    Model(Selector, Vec<crate::config::Model>),
+    Model(Selector, Vec<Model>),
     Thinking(Selector, Vec<ThinkingLevel>),
     Session(Selector, Vec<PathBuf>),
+    Login(Box<Login>),
+}
+
+/// `/login` in progress: the base URL step, then the API key step.
+struct Login {
+    provider: String,
+    /// Connection settings to check the key with: an existing model of the provider, or a
+    /// placeholder for a new provider.
+    template: Model,
+    /// The base URL before `/login`, so only a changed URL is written to models.json.
+    previous_url: Option<String>,
+    /// The entered base URL, once past the first step.
+    base_url: Option<String>,
+    prompt: TextPrompt,
+}
+
+/// A `/login` whose key has been checked, ready to save.
+struct CheckedLogin {
+    provider: String,
+    base_url: String,
+    /// The base URL to write to models.json, when it changed.
+    save_url: Option<String>,
+    key: String,
+    check: CredentialCheck,
 }
 
 struct App {
@@ -283,6 +313,11 @@ impl App {
         self.commit(vec![render::error_line(text)]);
     }
 
+    fn warning(&mut self, text: &str) {
+        self.gap();
+        self.commit(vec![Line::indented(paint(YELLOW, &format!("warning: {text}")), "", "  ")]);
+    }
+
     fn tool_max_lines(&self) -> usize {
         if self.expanded { self.tool_lines * 20 } else { self.tool_lines }
     }
@@ -316,7 +351,7 @@ impl App {
         if stats.cost > 0.0 {
             right.push_str(&format!(" · ${:.2}", stats.cost));
         }
-        right.push_str(&format!(" · {}", self.agent.setup().registry.label(&model)));
+        right.push_str(&format!(" · {}", self.agent.registry().label(&model)));
         if !model.thinking_levels.is_empty() {
             right.push_str(&format!(" · {thinking}"));
         }
@@ -449,13 +484,20 @@ impl App {
 
         if let Some(overlay) = &self.overlay {
             lines.push(border.clone());
-            let selector = match overlay {
-                Overlay::Model(s, _) | Overlay::Thinking(s, _) | Overlay::Session(s, _) => s,
-            };
-            lines.extend(selector.render(width));
+            let mut cursor = None;
+            match overlay {
+                Overlay::Login(login) => {
+                    let (prompt, column) = login.prompt.render(width);
+                    cursor = Some((lines.len() + 1, column));
+                    lines.extend(prompt);
+                }
+                Overlay::Model(s, _) | Overlay::Thinking(s, _) | Overlay::Session(s, _) => {
+                    lines.extend(s.render(width))
+                }
+            }
             lines.push(border);
             lines.push(self.footer_line(width));
-            return (lines, None);
+            return (lines, cursor);
         }
 
         if !self.attachments.is_empty() {
@@ -703,6 +745,7 @@ impl App {
                 }
                 self.refresh_footer();
             }
+            AppMsg::LoginChecked(login) => self.finish_login(*login),
             AppMsg::CompactDone(result) => {
                 // Success and failure are reported through compaction events; only report
                 // errors that happened before compaction started.
@@ -738,6 +781,10 @@ impl App {
                 }
             }
             Event::Paste(text) => {
+                if let Some(Overlay::Login(login)) = &mut self.overlay {
+                    login.prompt.paste(&text);
+                    return Ok(());
+                }
                 if self.overlay.is_some() {
                     return Ok(());
                 }
@@ -1080,7 +1127,7 @@ impl App {
             }
             "quit" => self.quit = true,
             "model" if args.is_empty() => self.open_model_selector(),
-            "model" => match self.agent.setup().registry.find(args) {
+            "model" => match self.agent.registry().find(args) {
                 Ok(model) => self.apply_model(model, false)?,
                 Err(err) => self.error(&format!("{err:#}")),
             },
@@ -1118,6 +1165,7 @@ impl App {
                 });
             }
             "autocompact" => self.autocompact(args),
+            "login" => self.start_login(args),
             "copy" => match self.agent.last_assistant_text() {
                 Some(text) => match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
                     Ok(()) => self.notice = Some("Copied the last response.".into()),
@@ -1135,7 +1183,7 @@ impl App {
     fn autocompact(&mut self, args: &str) {
         let model = self.agent.model();
         let key = model.key();
-        let label = self.agent.setup().registry.label(&model);
+        let label = self.agent.registry().label(&model);
         let arg = args.trim().to_ascii_lowercase();
         let saved = match arg.as_str() {
             "" => Ok(()),
@@ -1192,6 +1240,132 @@ impl App {
         self.refresh_footer();
     }
 
+    /// `/login <provider>`: ask for the base URL and API key, check the key, and save it.
+    fn start_login(&mut self, args: &str) {
+        let registry = self.agent.registry();
+        let provider = args.trim();
+        if provider.is_empty() || provider.contains(char::is_whitespace) {
+            self.error(&format!("Usage: /login <provider> (configured: {})", registry.providers().join(", ")));
+            return;
+        }
+        let existing = registry.provider_model(provider).cloned();
+        let previous_url = existing.as_ref().map(|model| model.base_url.clone());
+        let title = if existing.is_some() {
+            format!("Base URL for {provider}")
+        } else {
+            format!("Base URL for {provider} (new provider)")
+        };
+        let prompt =
+            TextPrompt::new(title, previous_url.as_deref().unwrap_or(""), false, "enter continue · esc cancel");
+        self.overlay = Some(Overlay::Login(Box::new(Login {
+            provider: provider.to_string(),
+            template: existing.unwrap_or_else(|| Model::connection(provider, "")),
+            previous_url,
+            base_url: None,
+            prompt,
+        })));
+    }
+
+    fn on_login_key(&mut self, key: KeyEvent) {
+        let Some(Overlay::Login(login)) = &mut self.overlay else { return };
+        let value = match login.prompt.handle_key(key) {
+            PromptAction::None => return,
+            PromptAction::Cancel => {
+                self.overlay = None;
+                self.notice = Some("Login cancelled.".into());
+                return;
+            }
+            PromptAction::Submit(value) => value,
+        };
+        if login.base_url.is_none() {
+            let url = value.trim_end_matches('/');
+            let host = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"));
+            if host.is_none_or(str::is_empty) {
+                login.prompt.set_error("Enter a URL starting with https:// or http://");
+                return;
+            }
+            login.base_url = Some(url.to_string());
+            login.prompt = TextPrompt::new(
+                format!("API key for {}", login.provider),
+                "",
+                true,
+                "paste or type the key · enter check and save · esc cancel",
+            );
+            return;
+        }
+        if value.is_empty() {
+            login.prompt.set_error("Enter the API key");
+            return;
+        }
+
+        let Some(Overlay::Login(login)) = self.overlay.take() else { return };
+        let Login { provider, mut template, previous_url, base_url, .. } = *login;
+        let base_url = base_url.expect("the base URL step comes first");
+        template.base_url = base_url.clone();
+        let save_url = (previous_url.as_deref() != Some(base_url.as_str())).then(|| base_url.clone());
+        self.notice = Some(format!("Checking the key with {base_url}…"));
+        let (client, tx) = (self.agent.http_client().clone(), self.app_tx.clone());
+        tokio::spawn(async move {
+            let check = crate::provider::check_credentials(&client, &template, &value).await;
+            let login = CheckedLogin { provider, base_url, save_url, key: value, check };
+            let _ = tx.send(AppMsg::LoginChecked(Box::new(login)));
+        });
+    }
+
+    /// Save a checked login to auth.json and models.json and start using it.
+    fn finish_login(&mut self, login: CheckedLogin) {
+        self.notice = None;
+        let outcome = match &login.check {
+            CredentialCheck::Rejected(message) => {
+                self.error(&format!("{} rejected the key: {message}. Nothing was saved.", login.provider));
+                return;
+            }
+            CredentialCheck::Accepted(count) => format!("the server lists {count} models"),
+            CredentialCheck::Unverified(reason) => format!("the key could not be verified ({reason})"),
+        };
+        let saved = (|| -> Result<ModelRegistry> {
+            let mut auth = AuthStore::load()?;
+            auth.set_api_key(&login.provider, &login.key);
+            auth.save()?;
+            crate::config::save_login(&login.provider, login.save_url.as_deref())?;
+            ModelRegistry::load()
+        })();
+        let registry = match saved {
+            Ok(registry) => registry,
+            Err(err) => {
+                self.error(&format!("Could not save the login: {err:#}"));
+                return;
+            }
+        };
+        let configured = registry.all().iter().any(|model| model.provider == login.provider);
+        // Without a usable model, start using the provider just logged in to.
+        let replacement = (!has_credentials(&self.agent.model()))
+            .then(|| registry.available().into_iter().find(|model| model.provider == login.provider).cloned())
+            .flatten();
+        self.agent.set_registry(registry);
+        let switched = replacement.and_then(|model| {
+            let label = self.agent.registry().label(&model);
+            self.agent.set_model(model).ok().map(|()| label)
+        });
+        let mut text = format!(
+            "Logged in to {} at {}: {outcome}. The key is saved in {}.",
+            login.provider,
+            login.base_url,
+            crate::util::tildify(&auth_path())
+        );
+        if !configured {
+            text.push_str(" No models are configured for this provider yet; add them to models.json.");
+        }
+        if let Some(label) = switched {
+            text.push_str(&format!(" Now using {label}."));
+        }
+        match login.check {
+            CredentialCheck::Accepted(_) => self.notice(&text),
+            _ => self.warning(&text),
+        }
+        self.refresh_footer();
+    }
+
     fn show_session(&mut self) {
         let stats = self.agent.stats();
         let mut lines = vec![Line::plain(bold("Session"))];
@@ -1232,7 +1406,7 @@ impl App {
 
     fn apply_model(&mut self, model: crate::config::Model, save: bool) -> Result<()> {
         let key = model.key();
-        let label = self.agent.setup().registry.label(&model);
+        let label = self.agent.registry().label(&model);
         self.agent.set_model(model)?;
         if save {
             Settings::save_global(|map| {
@@ -1247,7 +1421,7 @@ impl App {
     fn open_model_selector(&mut self) {
         let current = self.agent.model().key();
         // Models without credentials are listed only when nothing is usable, to explain why.
-        let registry = &self.agent.setup().registry;
+        let registry = &self.agent.registry();
         let available: Vec<&crate::config::Model> = registry.available();
         let models: Vec<crate::config::Model> =
             if available.is_empty() { registry.all().to_vec() } else { available.into_iter().cloned().collect() };
@@ -1309,6 +1483,10 @@ impl App {
         let Some(overlay) = &mut self.overlay else { return Ok(()) };
         let selector = match overlay {
             Overlay::Model(s, _) | Overlay::Thinking(s, _) | Overlay::Session(s, _) => s,
+            Overlay::Login(_) => {
+                self.on_login_key(key);
+                return Ok(());
+            }
         };
         let (index, save) = match selector.handle_key(key) {
             SelectAction::None => return Ok(()),
@@ -1319,6 +1497,7 @@ impl App {
             SelectAction::Choose { index, save } => (index, save),
         };
         match self.overlay.take().expect("overlay checked above") {
+            Overlay::Login(_) => unreachable!("login keys are handled above"),
             Overlay::Model(_, mut models) => self.apply_model(models.swap_remove(index), save)?,
             Overlay::Thinking(_, levels) => {
                 let applied = self.agent.set_thinking(levels[index])?;

@@ -42,7 +42,7 @@ Output flows into your terminal's normal scrollback, so scrolling, selection, an
 - **Shift+Enter**, **Ctrl+J**, or `\` then Enter inserts a newline.
 - **Shift+Tab** cycles the thinking level, **Ctrl+L** picks a model (only models with credentials are listed), **Ctrl+G** opens `$VISUAL`/`$EDITOR`, **Ctrl+V** pastes a clipboard image. Dragging an image file into the terminal attaches it.
 - `!command` runs a shell command and adds its output to the conversation; `!!command` keeps it out of the model's context.
-- `/help` lists commands: `/model`, `/thinking`, `/new`, `/resume`, `/session`, `/name`, `/compact`, `/autocompact`, `/copy`, `/hotkeys`, `/quit`, and `/skill:<name>`.
+- `/help` lists commands: `/model`, `/thinking`, `/new`, `/resume`, `/session`, `/name`, `/compact`, `/autocompact`, `/login`, `/copy`, `/hotkeys`, `/quit`, and `/skill:<name>`.
 
 ## Tools
 
@@ -57,10 +57,17 @@ Everything lives in `~/.viper` (override with `VIPER_DIR`):
 | Path | Purpose |
 |---|---|
 | `settings.json` | Settings; merged with `<project>/.viper/settings.json` |
-| `models.json` | Providers and models (LiteLLM, base URL overrides) |
+| `models.json` | Providers and models (LiteLLM, base URL overrides); no secrets, safe to share |
+| `auth.json` | API keys saved by `/login`, readable only by you |
 | `AGENTS.md` | Instructions added to every session |
 | `skills/` | User skills |
 | `sessions/` | Saved sessions, grouped by working directory |
+
+### Logging in
+
+`/login <provider>` asks for the provider's base URL and API key, checks the key by listing the server's models, and saves it: the key to `auth.json` (mode 0600) and the URL to `models.json`. A key the server rejects is not saved. Logging in removes a plaintext `apiKey` from that provider in `models.json`, and the new key takes effect immediately. Without any configured key, the interactive UI still starts so you can run `/login`.
+
+A provider's key is taken from, in order: `--api-key`, `auth.json`, `apiKey` in `models.json`, then (for the built-in `anthropic` provider) `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`.
 
 ### Anthropic
 
@@ -76,17 +83,17 @@ The built-in `anthropic` provider reads `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_
 
 ### LiteLLM
 
-Add the gateway as a provider in `models.json`. Each model talks to the gateway through either its Anthropic-compatible endpoint (`/v1/messages`) or its OpenAI-compatible endpoint (`/v1/chat/completions`), chosen per model with `api`:
+Run `/login litellm` (or add `baseUrl` yourself), then list the gateway's models in `models.json`. Each model talks to the gateway through either its Anthropic-compatible endpoint (`/v1/messages`) or its OpenAI-compatible endpoint (`/v1/chat/completions`), chosen per model with `api`:
 
 ```json
 {
   "providers": {
     "litellm": {
       "baseUrl": "http://localhost:4000",
-      "apiKey": "$LITELLM_API_KEY",
       "api": "openai-completions",
       "models": [
         { "id": "claude-opus-5-5", "api": "anthropic-messages" },
+        { "id": "claude-opus-5-5", "alias": "claude-opus-5-5-openai", "name": "Claude Opus 5.5 (OpenAI API)" },
         { "id": "claude-sonnet", "base": "claude-sonnet-5-5", "api": "anthropic-messages" },
         { "id": "gpt-5", "contextWindow": 400000, "reasoning": "effort", "thinkingLevels": ["low", "medium", "high"] }
       ]
@@ -97,11 +104,11 @@ Add the gateway as a provider in `models.json`. Each model talks to the gateway 
 
 Model ids that name a built-in Claude model inherit its context window, output limit, thinking support, image support, and prices. The id can match exactly, after the last `/` (`anthropic/claude-opus-5-5`), or after the last `.` (Bedrock's `us.anthropic.claude-opus-5-5`). Use `base` to inherit from a built-in model under a different alias. Fields you set override inherited ones, which matters when a gateway prices or limits a model differently.
 
-To reach the same gateway model through both endpoints, define two providers with the same `baseUrl` and `apiKey`, since a model is identified by provider and id.
+viper identifies models as `provider/id`. To list the same gateway model twice (for example through both endpoints), give one an `alias`: viper selects it as `provider/alias` and still sends `id` to the gateway.
 
 Provider fields: `baseUrl`, `apiKey`, `api` (`anthropic-messages` or `openai-completions`), `authHeader` (`bearer`, the default for custom providers, or `xapikey`), `headers`.
 
-Model fields: `id`, `name`, `base`, `api`, `contextWindow`, `maxTokens`, `reasoning` (`adaptive`, `budget`, `effort`, `none`), `thinkingLevels`, `images`, `cost` (`input`, `output`, `cacheRead`, `cacheWrite` in dollars per million tokens), `cacheControl`, `eagerInputStreaming`, `headers`, and `extraBody` (fields merged into every request body).
+Model fields: `id`, `alias`, `name`, `base`, `api`, `contextWindow`, `maxTokens`, `reasoning` (`adaptive`, `budget`, `effort`, `none`), `thinkingLevels`, `images`, `cost` (`input`, `output`, `cacheRead`, `cacheWrite` in dollars per million tokens), `cacheControl`, `eagerInputStreaming`, `headers`, and `extraBody` (fields merged into every request body).
 
 `apiKey` and header values accept `$VAR` or `${VAR}`, `!command` (the command's output, run per request), or a literal.
 

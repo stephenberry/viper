@@ -11,7 +11,7 @@ use super::{
 use crate::config::{Model, Reasoning, ThinkingLevel};
 use crate::message::{AssistantMessage, ContentBlock, Message, StopReason};
 
-const API_VERSION: &str = "2023-06-01";
+pub(super) const API_VERSION: &str = "2023-06-01";
 const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 
 pub(super) fn endpoint(base_url: &str) -> String {
@@ -400,11 +400,7 @@ pub(super) async fn stream(
     cancel: &CancellationToken,
 ) -> Result<(), ProviderError> {
     let (body, betas) = build_body(request);
-    let mut builder = client
-        .post(endpoint(&request.model.base_url))
-        .header("anthropic-version", API_VERSION)
-        .header("accept", "text/event-stream")
-        .json(&body);
+    let mut builder = client.post(endpoint(&request.model.base_url)).header("accept", "text/event-stream").json(&body);
     if !betas.is_empty() {
         builder = builder.header("anthropic-beta", betas.join(","));
     }

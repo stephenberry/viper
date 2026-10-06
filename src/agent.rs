@@ -140,7 +140,6 @@ pub enum QueueMode {
 pub struct AgentSetup {
     pub cwd: PathBuf,
     pub settings: Settings,
-    pub registry: ModelRegistry,
     pub tools: Vec<Arc<dyn Tool>>,
     pub system_prompt: String,
     pub context_files: Vec<ContextFile>,
@@ -149,6 +148,8 @@ pub struct AgentSetup {
 }
 
 struct State {
+    /// Configured models; replaced when credentials change (`/login`).
+    registry: Arc<ModelRegistry>,
     model: Model,
     thinking: ThinkingLevel,
     session: SessionStore,
@@ -226,6 +227,7 @@ fn text_of(message: &UserMessage) -> String {
 impl Agent {
     pub fn new(
         setup: AgentSetup,
+        registry: ModelRegistry,
         model: Model,
         thinking: ThinkingLevel,
         session: SessionStore,
@@ -248,6 +250,7 @@ impl Agent {
                 .filter_map(|(key, settings)| Some((key.clone(), settings.auto_compact_window?)))
                 .collect(),
             auto_retry: setup.settings.retry.enabled,
+            registry: Arc::new(registry),
             model,
             thinking,
             session,
@@ -285,7 +288,7 @@ impl Agent {
     /// Persist the current model and thinking level if they differ from the session's record.
     fn record_model_if_changed(&self) -> Result<()> {
         let mut state = self.state();
-        let model_key = (state.model.provider.clone(), state.model.id.clone());
+        let model_key = (state.model.provider.clone(), state.model.local_id().to_string());
         if state.session.last_model().as_ref() != Some(&model_key) {
             state.session.append(Entry::ModelChange {
                 id: new_entry_id(),
@@ -402,6 +405,26 @@ impl Agent {
 
     // --- Settings -----------------------------------------------------------------------------
 
+    pub fn registry(&self) -> Arc<ModelRegistry> {
+        self.state().registry.clone()
+    }
+
+    /// Replace the configured models (after `/login`). The current model is refreshed from the
+    /// new registry so it uses the new base URL and key.
+    pub fn set_registry(&self, registry: ModelRegistry) {
+        let mut state = self.state();
+        let key = state.model.key();
+        if let Some(model) = registry.all().iter().find(|m| m.key() == key) {
+            state.model = model.clone();
+        }
+        state.registry = Arc::new(registry);
+    }
+
+    /// The HTTP client used for model requests.
+    pub fn http_client(&self) -> &reqwest::Client {
+        &self.inner.client
+    }
+
     /// Switch models. Fails without changing anything when the model has no API key.
     pub fn set_model(&self, model: Model) -> Result<()> {
         crate::config::ensure_credentials(&model)?;
@@ -516,7 +539,7 @@ impl Agent {
             let mut state = self.state();
             Self::require_idle(&state)?;
             if let Some((provider, id)) = session.last_model()
-                && let Ok(model) = self.inner.setup.registry.find(&format!("{provider}/{id}"))
+                && let Ok(model) = state.registry.find(&format!("{provider}/{id}"))
             {
                 state.model = model;
             }
@@ -1085,7 +1108,6 @@ mod tests {
         let setup = AgentSetup {
             cwd: cwd.to_path_buf(),
             settings,
-            registry: ModelRegistry::from_models(vec![model.clone()]),
             tools,
             system_prompt: "test system prompt".into(),
             context_files: Vec::new(),
@@ -1094,7 +1116,8 @@ mod tests {
         };
         let (tx, rx) = mpsc::unbounded_channel();
         let session = SessionStore::create(cwd, false);
-        (Agent::new(setup, model, ThinkingLevel::High, session, tx).unwrap(), rx)
+        let registry = ModelRegistry::from_models(vec![model.clone()]);
+        (Agent::new(setup, registry, model, ThinkingLevel::High, session, tx).unwrap(), rx)
     }
 
     fn anthropic_tool_call(id: &str, command: &str) -> MockResponse {

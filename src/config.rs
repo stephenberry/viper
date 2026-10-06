@@ -46,6 +46,44 @@ pub fn project_settings_path(cwd: &Path) -> PathBuf {
     cwd.join(".viper").join("settings.json")
 }
 
+/// Record a `/login` in models.json: set the provider's base URL (`None` leaves it alone) and
+/// remove a literal `apiKey`, since auth.json now holds the key. `$VAR` and `!command` keys are
+/// left as they are.
+pub fn save_login(provider: &str, base_url: Option<&str>) -> Result<()> {
+    save_login_to(&models_path(), provider, base_url)
+}
+
+fn save_login_to(path: &Path, provider: &str, base_url: Option<&str>) -> Result<()> {
+    let mut root = read_json_file(path)?.unwrap_or_else(|| Value::Object(Default::default()));
+    let invalid = || anyhow!("{} has an unexpected shape: providers must be objects", path.display());
+    let Value::Object(root_map) = &mut root else { return Err(invalid()) };
+    let Value::Object(providers) = root_map.entry("providers").or_insert_with(|| Value::Object(Default::default()))
+    else {
+        return Err(invalid());
+    };
+    let Value::Object(entry) = providers.entry(provider).or_insert_with(|| Value::Object(Default::default())) else {
+        return Err(invalid());
+    };
+    if let Some(url) = base_url {
+        entry.insert("baseUrl".into(), Value::String(url.to_string()));
+    }
+    let literal_key = entry
+        .get("apiKey")
+        .and_then(Value::as_str)
+        .is_some_and(|key| matches!(ConfigValue::parse(key), ConfigValue::Literal(_)));
+    if literal_key {
+        entry.remove("apiKey");
+    }
+    if entry.is_empty() {
+        providers.remove(provider);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&root)? + "\n")
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
 /// Expand a leading `~` to the home directory.
 pub fn expand_home(path: &str) -> PathBuf {
     if path == "~" {
@@ -394,7 +432,12 @@ pub struct ModelCost {
 #[serde(rename_all = "camelCase")]
 pub struct Model {
     pub provider: String,
+    /// Model id sent to the API.
     pub id: String,
+    /// Name viper selects the model by in place of `id`, so a provider can list the same API
+    /// model more than once (for example through two endpoints of one gateway).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
     pub name: String,
     pub api: Api,
     pub base_url: String,
@@ -419,8 +462,40 @@ pub struct Model {
 }
 
 impl Model {
+    /// A placeholder carrying only the connection settings of a provider that has no models
+    /// configured yet, with the defaults custom providers get: the OpenAI-compatible API and a
+    /// bearer token. Used to check credentials during `/login`.
+    pub fn connection(provider: &str, base_url: &str) -> Model {
+        Model {
+            provider: provider.to_string(),
+            id: String::new(),
+            alias: None,
+            name: provider.to_string(),
+            api: Api::OpenAiCompletions,
+            base_url: base_url.to_string(),
+            api_key: None,
+            auth_header: AuthHeader::Bearer,
+            headers: BTreeMap::new(),
+            extra_body: None,
+            context_window: 0,
+            max_tokens: 0,
+            reasoning: Reasoning::None,
+            thinking_levels: Vec::new(),
+            images: false,
+            cost: ModelCost::default(),
+            eager_input_streaming: false,
+            cache_control: false,
+        }
+    }
+
+    /// The model's name within its provider: its alias, else its id.
+    pub fn local_id(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.id)
+    }
+
+    /// `provider/local-id`, which identifies the model in settings, sessions, and `--model`.
     pub fn key(&self) -> String {
-        format!("{}/{}", self.provider, self.id)
+        format!("{}/{}", self.provider, self.local_id())
     }
 
     /// Clamp `level` to the closest level this model supports, preferring lower levels.
@@ -534,6 +609,7 @@ struct ProviderConfig {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ModelConfig {
     id: String,
+    alias: Option<String>,
     name: Option<String>,
     /// Built-in Anthropic model whose metadata this model inherits. Defaults to the built-in model
     /// that this id names, if any (see `inferred_builtin`).
@@ -698,6 +774,7 @@ pub(crate) fn builtin_anthropic_models() -> Vec<Model> {
         .map(|b| Model {
             provider: "anthropic".into(),
             id: b.id.into(),
+            alias: None,
             name: b.name.into(),
             api: Api::AnthropicMessages,
             base_url: base_url.clone(),
@@ -715,6 +792,19 @@ pub(crate) fn builtin_anthropic_models() -> Vec<Model> {
             cache_control: true,
         })
         .collect()
+}
+
+/// The models a models.json provider lists. Each needs a distinct `alias` or `id`.
+fn provider_models(provider_name: &str, provider: &ProviderConfig) -> Result<Vec<Model>> {
+    let mut models: Vec<Model> = Vec::new();
+    for config in &provider.models {
+        let model = resolve_custom_model(provider_name, provider, config)?;
+        if models.iter().any(|m| m.local_id() == model.local_id()) {
+            bail!("model '{}' appears twice in provider '{provider_name}'; give one an \"alias\"", model.local_id());
+        }
+        models.push(model);
+    }
+    Ok(models)
 }
 
 fn resolve_custom_model(provider_name: &str, provider: &ProviderConfig, config: &ModelConfig) -> Result<Model> {
@@ -752,9 +842,13 @@ fn resolve_custom_model(provider_name: &str, provider: &ProviderConfig, config: 
     let headers =
         provider.headers.iter().chain(&config.headers).map(|(k, v)| (k.clone(), ConfigValue::parse(v))).collect();
 
+    if config.alias.as_deref().is_some_and(|alias| alias.trim().is_empty()) {
+        bail!("model '{}' in provider '{provider_name}' has an empty alias", config.id);
+    }
     Ok(Model {
         provider: provider_name.to_string(),
         id: config.id.clone(),
+        alias: config.alias.clone(),
         name: config
             .name
             .clone()
@@ -814,15 +908,42 @@ impl ModelRegistry {
                 if provider_name == "anthropic" {
                     models.retain(|m| m.provider != "anthropic");
                 }
-                for config in &provider.models {
-                    let model = resolve_custom_model(provider_name, provider, config)
-                        .with_context(|| format!("in {}", path.display()))?;
+                for model in
+                    provider_models(provider_name, provider).with_context(|| format!("in {}", path.display()))?
+                {
                     models.retain(|m| m.key() != model.key());
                     models.push(model);
                 }
             }
         }
-        Ok(ModelRegistry { models })
+        let mut registry = ModelRegistry { models };
+        registry.apply_auth(&crate::auth::AuthStore::load()?);
+        Ok(registry)
+    }
+
+    /// Use keys saved by `/login`; they take precedence over `apiKey` in models.json.
+    pub fn apply_auth(&mut self, auth: &crate::auth::AuthStore) {
+        for model in &mut self.models {
+            if let Some(key) = auth.api_key(&model.provider) {
+                model.api_key = Some(ConfigValue::Literal(key.to_string()));
+            }
+        }
+    }
+
+    /// Provider names, in the order their models are listed.
+    pub fn providers(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = Vec::new();
+        for model in &self.models {
+            if !names.contains(&model.provider.as_str()) {
+                names.push(&model.provider);
+            }
+        }
+        names
+    }
+
+    /// A model of `provider`, for its connection settings (base URL, API, auth header).
+    pub fn provider_model(&self, provider: &str) -> Option<&Model> {
+        self.models.iter().find(|m| m.provider == provider)
     }
 
     #[cfg(test)]
@@ -877,9 +998,19 @@ impl ModelRegistry {
 
     /// Short label for display: the model's name, plus its provider when another usable model
     /// has the same name.
+    /// Short label for display: the model's name, plus its provider (or, within one provider,
+    /// its alias or id) when another usable model has the same name.
     pub fn label(&self, model: &Model) -> String {
-        let shared = self.available().iter().any(|other| other.name == model.name && other.key() != model.key());
-        if shared { format!("{} ({})", model.name, model.provider) } else { model.name.clone() }
+        let available = self.available();
+        let twins: Vec<&&Model> =
+            available.iter().filter(|other| other.name == model.name && other.key() != model.key()).collect();
+        if twins.is_empty() {
+            model.name.clone()
+        } else if twins.iter().any(|other| other.provider == model.provider) {
+            format!("{} ({})", model.name, model.local_id())
+        } else {
+            format!("{} ({})", model.name, model.provider)
+        }
     }
 
     /// The model for a new session: settings default, else the first model with credentials.
@@ -1021,6 +1152,70 @@ mod tests {
         assert_eq!(registry.label(&direct), "Claude Opus 5.5");
         let registry = ModelRegistry::from_models(vec![direct.clone(), gateway, unusable]);
         assert_eq!(registry.label(&direct), "Claude Opus 5.5 (direct)");
+    }
+
+    #[test]
+    fn aliases_let_a_provider_list_a_model_twice() {
+        let id = "gateway.anthropic.claude-opus-5-5";
+        let mut provider = ProviderConfig {
+            base_url: Some("http://localhost:4000".into()),
+            api: Some(Api::AnthropicMessages),
+            models: vec![
+                ModelConfig { id: id.into(), ..Default::default() },
+                ModelConfig { id: id.into(), api: Some(Api::OpenAiCompletions), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        let err = provider_models("gw", &provider).unwrap_err().to_string();
+        assert!(err.contains("give one an \"alias\""), "{err}");
+
+        provider.models[1].alias = Some("opus-openai".into());
+        let models = provider_models("gw", &provider).unwrap();
+        assert_eq!(models[1].key(), "gw/opus-openai");
+        assert_eq!(models[1].id, id);
+        assert_eq!(models[1].api, Api::OpenAiCompletions);
+
+        let registry = ModelRegistry::from_models(
+            models.into_iter().map(|m| Model { api_key: Some(ConfigValue::Literal("k".into())), ..m }).collect(),
+        );
+        let opus = registry.find("gw/opus-openai").unwrap();
+        assert_eq!(registry.label(&opus), "Claude Opus 5.5 (opus-openai)");
+    }
+
+    #[test]
+    fn auth_keys_override_models_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut auth = crate::auth::AuthStore::default();
+        auth.set_api_key("gw", "from-auth");
+        auth.save_to(&dir.path().join("auth.json")).unwrap();
+        let auth = crate::auth::AuthStore::load_from(&dir.path().join("auth.json")).unwrap();
+
+        let model =
+            Model { api_key: Some(ConfigValue::Env("UNSET_VAR".into())), ..Model::connection("gw", "http://x") };
+        let mut registry = ModelRegistry::from_models(vec![model]);
+        registry.apply_auth(&auth);
+        assert_eq!(registry.all()[0].api_key, Some(ConfigValue::Literal("from-auth".into())));
+    }
+
+    #[test]
+    fn save_login_sets_url_and_drops_literal_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(
+            &path,
+            r#"{"providers": {"gw": {"baseUrl": "http://old", "apiKey": "sk-secret", "models": [{"id": "m"}]},
+                              "other": {"baseUrl": "http://o", "apiKey": "$OTHER_KEY"}}}"#,
+        )
+        .unwrap();
+        save_login_to(&path, "gw", Some("https://new")).unwrap();
+        save_login_to(&path, "other", None).unwrap();
+        save_login_to(&path, "fresh", Some("https://fresh")).unwrap();
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["providers"]["gw"]["baseUrl"], "https://new");
+        assert!(saved["providers"]["gw"].get("apiKey").is_none());
+        assert_eq!(saved["providers"]["gw"]["models"][0]["id"], "m");
+        assert_eq!(saved["providers"]["other"]["apiKey"], "$OTHER_KEY");
+        assert_eq!(saved["providers"]["fresh"]["baseUrl"], "https://fresh");
     }
 
     #[test]
