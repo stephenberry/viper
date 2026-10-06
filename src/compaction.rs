@@ -2,7 +2,9 @@
 //!
 //! The most recent `keepRecentTokens` of conversation stay verbatim. Everything before the cut
 //! point (plus any previous summary) is summarized by the current model into a structured
-//! checkpoint that replaces it in later requests. The full history stays in the session file.
+//! checkpoint that replaces it in later requests. When the cut falls inside a turn, the turn's
+//! beginning is summarized separately and appended as turn context. The full history stays in the
+//! session file.
 
 use std::collections::BTreeSet;
 
@@ -56,6 +58,21 @@ const UPDATE_RULES: &str = "Update the existing structured summary with new info
 - PRESERVE exact file paths, function names, and error messages
 - If something is no longer relevant, you may remove it";
 
+const TURN_PREFIX_PROMPT: &str = "The messages above are the beginning of a turn that is still in progress. The rest of the turn is kept verbatim after this checkpoint and does not need to be reconstructed.
+
+Create a concise checkpoint of the user's request and the progress shown above, in this format:
+
+## Original Request
+[What did the user ask for? Keep their wording where it matters.]
+
+## Progress So Far
+- [Key decisions and work completed in these messages]
+
+## Context Needed to Continue
+- [Information from these messages needed to understand the later work]
+
+Only summarize information explicitly present above. Preserve exact file paths, function names, and error messages.";
+
 const TOOL_RESULT_MAX_CHARS: usize = 2000;
 
 /// Estimate the tokens the current context occupies: the last successful response's reported
@@ -94,7 +111,12 @@ pub struct CompactionResult {
 
 /// What a compaction will summarize and keep.
 pub struct Plan {
+    /// Conversation before the kept region, or before the turn it cuts into.
     pub to_summarize: Vec<Message>,
+    /// When the cut falls inside a turn, the turn's messages before the cut: the request that
+    /// started it and the work so far. They get their own summary so the request is not lost
+    /// among older history.
+    pub turn_prefix: Vec<Message>,
     pub previous_summary: Option<String>,
     /// First kept entry, or `None` when nothing is kept.
     pub first_kept_entry_id: Option<String>,
@@ -104,7 +126,8 @@ pub struct Plan {
 }
 
 /// Choose the cut point: keep roughly `keep_recent_tokens` of recent messages, starting at a user
-/// or assistant message so tool calls stay paired with their results.
+/// or assistant message so tool calls stay paired with their results. A cut at an assistant
+/// message splits its turn; the turn's beginning is then summarized on its own.
 pub fn plan(items: &[ContextItem], keep_recent_tokens: u64, previous_details: Option<&Value>) -> Option<Plan> {
     let (previous_summary, start) = match items.first().map(|i| &i.message) {
         Some(Message::CompactionSummary(summary)) => (Some(summary.summary.clone()), 1),
@@ -149,8 +172,16 @@ pub fn plan(items: &[ContextItem], keep_recent_tokens: u64, previous_details: Op
         read_files.extend(strings("readFiles"));
         modified_files.extend(strings("modifiedFiles"));
     }
-    let to_summarize: Vec<Message> = body[..cut].iter().map(|i| i.message.clone()).collect();
-    for message in &to_summarize {
+    // A turn starts with the user's message (or command); a cut anywhere else splits one.
+    let starts_turn = |message: &Message| matches!(message, Message::User(_) | Message::BashExecution(_));
+    let turn_start = body
+        .get(cut)
+        .filter(|item| !starts_turn(&item.message))
+        .and_then(|_| body[..cut].iter().rposition(|item| starts_turn(&item.message)));
+    let history_end = turn_start.unwrap_or(cut);
+    let to_summarize: Vec<Message> = body[..history_end].iter().map(|i| i.message.clone()).collect();
+    let turn_prefix: Vec<Message> = body[history_end..cut].iter().map(|i| i.message.clone()).collect();
+    for message in to_summarize.iter().chain(&turn_prefix) {
         if let Message::Assistant(assistant) = message {
             for call in assistant.tool_calls() {
                 let Some(path) = call.arguments.get("path").and_then(Value::as_str) else { continue };
@@ -170,6 +201,7 @@ pub fn plan(items: &[ContextItem], keep_recent_tokens: u64, previous_details: Op
 
     Some(Plan {
         to_summarize,
+        turn_prefix,
         previous_summary,
         first_kept_entry_id: body.get(cut).and_then(|i| i.entry_id.clone()),
         tokens_before: estimate_context_tokens(&messages),
@@ -252,6 +284,13 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
     parts.join("\n\n")
 }
 
+fn focus(instructions: Option<&str>) -> String {
+    match instructions.map(str::trim).filter(|i| !i.is_empty()) {
+        Some(instructions) => format!("\n\nAdditional focus for this summary: {instructions}"),
+        None => String::new(),
+    }
+}
+
 fn summarization_prompt(plan: &Plan, instructions: Option<&str>) -> String {
     let mut prompt = format!("<conversation>\n{}\n</conversation>\n\n", serialize_conversation(&plan.to_summarize));
     match &plan.previous_summary {
@@ -266,23 +305,27 @@ fn summarization_prompt(plan: &Plan, instructions: Option<&str>) -> String {
         }
     }
     prompt.push_str(SUMMARY_FORMAT);
-    if let Some(instructions) = instructions.filter(|i| !i.trim().is_empty()) {
-        prompt.push_str(&format!("\n\nAdditional focus for this summary: {}", instructions.trim()));
-    }
+    prompt.push_str(&focus(instructions));
     prompt
 }
 
-/// Generate the summary for `plan` with `model`.
-pub async fn summarize(
+fn turn_prefix_prompt(plan: &Plan, instructions: Option<&str>) -> String {
+    format!(
+        "<conversation>\n{}\n</conversation>\n\n{TURN_PREFIX_PROMPT}{}",
+        serialize_conversation(&plan.turn_prefix),
+        focus(instructions)
+    )
+}
+
+/// Ask `model` for a summary with `prompt`, returning its text and usage.
+async fn generate(
     client: &reqwest::Client,
     model: &Model,
-    plan: &Plan,
-    instructions: Option<&str>,
-    reserve_tokens: u64,
+    prompt: String,
+    max_tokens: u64,
     cancel: &CancellationToken,
-) -> Result<CompactionResult, ProviderError> {
-    let messages =
-        vec![Message::User(UserMessage::new(vec![ContentBlock::text(summarization_prompt(plan, instructions))]))];
+) -> Result<(String, Usage), ProviderError> {
+    let messages = vec![Message::User(UserMessage::new(vec![ContentBlock::text(prompt)]))];
     let request = Request {
         model,
         system_prompt: SUMMARIZATION_SYSTEM_PROMPT,
@@ -290,7 +333,7 @@ pub async fn summarize(
         tools: &[],
         // Summaries need little reasoning; use the cheapest level the model supports.
         thinking: model.clamp_thinking(ThinkingLevel::Off),
-        max_tokens: Some((reserve_tokens * 4 / 5).max(4_096).min(model.max_tokens.max(4_096))),
+        max_tokens: Some(max_tokens.max(4_096).min(model.max_tokens.max(4_096))),
     };
     let mut response = provider::new_assistant_message(model, request.thinking);
     provider::stream(client, &request, &mut response, &mut |_, _| {}, cancel).await?;
@@ -308,10 +351,53 @@ pub async fn summarize(
         }
         _ => {}
     }
-    let mut summary = response.text().trim().to_string();
-    if summary.is_empty() {
+    let text = response.text().trim().to_string();
+    if text.is_empty() {
         return Err(ProviderError::fatal("Summarization returned no text"));
     }
+    Ok((text, response.usage))
+}
+
+/// Generate the summary for `plan` with `model`.
+pub async fn summarize(
+    client: &reqwest::Client,
+    model: &Model,
+    plan: &Plan,
+    instructions: Option<&str>,
+    reserve_tokens: u64,
+    cancel: &CancellationToken,
+) -> Result<CompactionResult, ProviderError> {
+    // The history and the beginning of a split turn are summarized concurrently.
+    let history = async {
+        if plan.to_summarize.is_empty() {
+            return Ok(None);
+        }
+        let prompt = summarization_prompt(plan, instructions);
+        generate(client, model, prompt, reserve_tokens * 4 / 5, cancel).await.map(Some)
+    };
+    let turn = async {
+        if plan.turn_prefix.is_empty() {
+            return Ok(None);
+        }
+        generate(client, model, turn_prefix_prompt(plan, instructions), reserve_tokens / 2, cancel).await.map(Some)
+    };
+    let (history, turn) = tokio::try_join!(history, turn)?;
+
+    let mut usage = Usage::default();
+    let history = match history {
+        Some((text, history_usage)) => {
+            usage.add(&history_usage);
+            text
+        }
+        None => plan.previous_summary.clone().unwrap_or_else(|| "No prior history.".to_string()),
+    };
+    let mut summary = match turn {
+        Some((text, turn_usage)) => {
+            usage.add(&turn_usage);
+            format!("{history}\n\n---\n\n**Turn Context (split turn):**\n\n{text}")
+        }
+        None => history,
+    };
     if !plan.read_files.is_empty() {
         summary.push_str(&format!(
             "\n\n<read-files>\n{}\n</read-files>",
@@ -329,7 +415,7 @@ pub async fn summarize(
         first_kept_entry_id: plan.first_kept_entry_id.clone(),
         tokens_before: plan.tokens_before,
         details: json!({"readFiles": plan.read_files, "modifiedFiles": plan.modified_files}),
-        usage: response.usage,
+        usage,
     })
 }
 
@@ -367,6 +453,8 @@ mod tests {
         let plan = plan(&items, 150, None).unwrap();
         assert_eq!(plan.first_kept_entry_id.as_deref(), Some("d"));
         assert_eq!(plan.to_summarize.len(), 3);
+        // The kept region starts a turn, so no turn is split.
+        assert!(plan.turn_prefix.is_empty());
     }
 
     #[test]

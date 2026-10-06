@@ -1314,6 +1314,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compaction_inside_a_turn_summarizes_its_request_separately() {
+        // Each command prints ~11k tokens, so the 20k tokens kept start inside the second turn.
+        let big = "head -c 46000 /dev/zero | tr '\\0' x";
+        let server = MockServer::start(vec![
+            anthropic_text("earlier answer"),
+            anthropic_tool_call("t1", big),
+            anthropic_tool_call("t2", big),
+            anthropic_text("built"),
+            anthropic_text("summary one"),
+            anthropic_text("summary two"),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, _events) = agent(model(&server.url, Api::AnthropicMessages), dir.path());
+        for text in ["earlier question", "build it"] {
+            agent.prompt(vec![ContentBlock::text(text)], None).unwrap();
+            agent.wait_idle().await;
+        }
+        let result = agent.compact(None).unwrap().await.unwrap().unwrap();
+        assert!(result.summary.contains("\n\n---\n\n**Turn Context (split turn):**\n\n"));
+        // The kept region starts at the second tool call, inside the "build it" turn.
+        assert_eq!(roles(&agent.messages()), ["summary", "assistant", "toolResult", "assistant"]);
+
+        // The history and the turn's beginning were summarized by separate requests.
+        let requests = server.requests.lock().unwrap();
+        let prompts: Vec<&str> =
+            requests[4..].iter().map(|r| r["messages"][0]["content"][0]["text"].as_str().unwrap()).collect();
+        let turn = prompts.iter().find(|p| p.contains("## Original Request")).unwrap();
+        let history = prompts.iter().find(|p| !p.contains("## Original Request")).unwrap();
+        assert!(turn.contains("build it") && !turn.contains("earlier answer"));
+        assert!(history.contains("earlier answer") && !history.contains("build it"));
+    }
+
+    #[tokio::test]
     async fn prompts_sent_during_a_command_run_after_it() {
         let server = MockServer::start(vec![anthropic_text("done")]).await;
         let dir = tempfile::tempdir().unwrap();
