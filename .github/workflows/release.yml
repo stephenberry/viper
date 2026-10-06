@@ -79,7 +79,7 @@ jobs:
         run: |
           name="viper-${GITHUB_REF_NAME}-${{ matrix.name }}"
           mkdir "$name"
-          cp README.md "$name/"
+          cp README.md LICENSE "$name/"
           case "$RUNNER_OS" in
             macOS)
               lipo -create -output "$name/viper" \
