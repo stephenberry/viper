@@ -48,7 +48,6 @@ impl Tool for WriteTool {
     async fn execute(&self, ctx: &ToolContext, args: Value, _update: UpdateFn) -> anyhow::Result<ToolOutput> {
         let args: Args = parse_args("write", args)?;
         let path = resolve_path(&args.path, &ctx.cwd);
-        let _guard = ctx.file_locks.lock(&path).await;
         if ctx.cancel.is_cancelled() {
             anyhow::bail!("Operation aborted");
         }

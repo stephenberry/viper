@@ -104,7 +104,6 @@ impl Tool for EditTool {
             anyhow::bail!("Edit tool input is invalid. edits must contain at least one replacement.");
         }
         let path = resolve_path(&args.path, &ctx.cwd);
-        let _guard = ctx.file_locks.lock(&path).await;
         if ctx.cancel.is_cancelled() {
             anyhow::bail!("Operation aborted");
         }

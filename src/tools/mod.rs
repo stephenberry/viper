@@ -12,9 +12,8 @@ pub mod shell;
 pub mod truncate;
 mod write;
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
@@ -52,27 +51,9 @@ impl ToolOutput {
 /// Callback for streaming partial output (used by bash).
 pub type UpdateFn = Arc<dyn Fn(ToolOutput) + Send + Sync>;
 
-/// Serializes writes to the same file across concurrently executing tool calls.
-#[derive(Default)]
-pub struct FileLocks {
-    locks: StdMutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
-}
-
-impl FileLocks {
-    pub async fn lock(&self, path: &Path) -> tokio::sync::OwnedMutexGuard<()> {
-        let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let lock = {
-            let mut locks = self.locks.lock().expect("file lock map poisoned");
-            locks.entry(key).or_default().clone()
-        };
-        lock.lock_owned().await
-    }
-}
-
 pub struct ToolContext {
     pub cwd: PathBuf,
     pub cancel: CancellationToken,
-    pub file_locks: Arc<FileLocks>,
     pub shell: shell::ShellConfig,
 }
 
@@ -87,6 +68,11 @@ pub trait Tool: Send + Sync {
     /// Usage rules added to the system prompt when this tool is enabled.
     fn guidelines(&self) -> &'static [&'static str] {
         &[]
+    }
+    /// Whether the tool only observes the workspace. Read-only calls run concurrently; any other
+    /// call runs alone, after the calls before it and before the calls after it.
+    fn read_only(&self) -> bool {
+        false
     }
     /// Execute with raw arguments. Errors become error results for the model.
     async fn execute(&self, ctx: &ToolContext, args: Value, update: UpdateFn) -> anyhow::Result<ToolOutput>;
@@ -130,15 +116,12 @@ pub use shell::{ShellConfig, run_shell_command};
 
 #[cfg(test)]
 pub(crate) mod tests_support {
+    use std::path::Path;
+
     use super::*;
 
     pub fn context(cwd: &Path) -> ToolContext {
-        ToolContext {
-            cwd: cwd.to_path_buf(),
-            cancel: CancellationToken::new(),
-            file_locks: Arc::new(FileLocks::default()),
-            shell: ShellConfig::resolve(None),
-        }
+        ToolContext { cwd: cwd.to_path_buf(), cancel: CancellationToken::new(), shell: ShellConfig::resolve(None) }
     }
 
     pub fn noop() -> UpdateFn {

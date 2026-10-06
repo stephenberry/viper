@@ -48,6 +48,10 @@ impl Tool for ReadTool {
         "Read file contents"
     }
 
+    fn read_only(&self) -> bool {
+        true
+    }
+
     fn guidelines(&self) -> &'static [&'static str] {
         &["Use read to examine files instead of cat or sed."]
     }
@@ -81,7 +85,8 @@ impl Tool for ReadTool {
 
         let text = String::from_utf8_lossy(&bytes);
         let text = text.strip_prefix('\u{FEFF}').unwrap_or(&text);
-        let lines: Vec<&str> = text.split('\n').collect();
+        // A trailing newline ends the last line rather than starting another.
+        let lines: Vec<&str> = text.strip_suffix('\n').unwrap_or(text).split('\n').collect();
         let total = lines.len();
         let start = args.offset.unwrap_or(1).max(1) - 1;
         if start >= total {
@@ -137,7 +142,7 @@ mod tests {
     #[tokio::test]
     async fn reads_with_offset_and_limit() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("f.txt"), "1\n2\n3\n4\n5").unwrap();
+        std::fs::write(dir.path().join("f.txt"), "1\n2\n3\n4\n5\n").unwrap();
         let ctx = context(dir.path());
         let out = ReadTool
             .execute(&ctx, json!({"path": "f.txt", "offset": 2, "limit": 2}), crate::tools::tests_support::noop())
@@ -148,7 +153,7 @@ mod tests {
             "2\n3\n\n[2 more lines in file. Use offset=4 to continue.]"
         );
         let err =
-            ReadTool.execute(&ctx, json!({"path": "f.txt", "offset": 9}), crate::tools::tests_support::noop()).await;
-        assert!(err.unwrap_err().to_string().contains("beyond end of file"));
+            ReadTool.execute(&ctx, json!({"path": "f.txt", "offset": 6}), crate::tools::tests_support::noop()).await;
+        assert!(err.unwrap_err().to_string().contains("beyond end of file (5 lines total)"));
     }
 }

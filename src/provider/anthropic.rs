@@ -55,7 +55,8 @@ fn user_blocks(content: &[ContentBlock]) -> Vec<Value> {
     content
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::Text { text } if !text.is_empty() => Some(json!({"type": "text", "text": text})),
+            // The API rejects whitespace-only text blocks.
+            ContentBlock::Text { text } if !text.trim().is_empty() => Some(json!({"type": "text", "text": text})),
             ContentBlock::Image { data, mime_type } => Some(image_block(data, mime_type)),
             _ => None,
         })
@@ -81,7 +82,9 @@ fn assistant_blocks(message: &AssistantMessage, model: &Model) -> Vec<Value> {
                     blocks.push(json!({"type": "text", "text": thinking}));
                 }
             }
-            ContentBlock::Text { text } if !text.is_empty() => blocks.push(json!({"type": "text", "text": text})),
+            ContentBlock::Text { text } if !text.trim().is_empty() => {
+                blocks.push(json!({"type": "text", "text": text}))
+            }
             ContentBlock::ToolCall { id, name, arguments, .. } => {
                 blocks.push(json!({"type": "tool_use", "id": sanitize_tool_id(id), "name": name, "input": arguments}));
             }
@@ -485,6 +488,8 @@ mod tests {
                 &foreign,
                 vec![
                     ContentBlock::Thinking { thinking: "plan".into(), signature: Some("sig".into()), redacted: false },
+                    // Some OpenAI-compatible models emit whitespace-only text before a tool call.
+                    ContentBlock::text("\n"),
                     ContentBlock::ToolCall {
                         id: "call|1".into(),
                         name: "ls".into(),

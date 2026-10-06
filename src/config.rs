@@ -451,7 +451,7 @@ struct ModelConfig {
     id: String,
     name: Option<String>,
     /// Built-in Anthropic model whose metadata this model inherits. Defaults to the built-in model
-    /// whose id equals this id's last path segment, if any.
+    /// that this id names, if any (see `inferred_builtin`).
     base: Option<String>,
     api: Option<Api>,
     context_window: Option<u64>,
@@ -574,6 +574,14 @@ fn builtin(id: &str) -> Option<&'static BuiltinModel> {
     BUILTIN_ANTHROPIC.iter().find(|model| model.id == id)
 }
 
+/// The built-in model a gateway model id refers to: the id itself, its last path segment
+/// (`anthropic/claude-opus-5-5`), or its last dotted segment (Bedrock's
+/// `us.anthropic.claude-opus-5-5`).
+fn inferred_builtin(id: &str) -> Option<&'static BuiltinModel> {
+    let segment = id.rsplit('/').next().unwrap_or(id);
+    builtin(id).or_else(|| builtin(segment)).or_else(|| builtin(segment.rsplit('.').next().unwrap_or(segment)))
+}
+
 pub(crate) fn builtin_anthropic_models() -> Vec<Model> {
     let (api_key, auth_header) = if std::env::var_os("ANTHROPIC_API_KEY").is_some() {
         (ConfigValue::Env("ANTHROPIC_API_KEY".into()), AuthHeader::XApiKey)
@@ -616,11 +624,12 @@ fn resolve_custom_model(provider_name: &str, provider: &ProviderConfig, config: 
         .clone()
         .ok_or_else(|| anyhow!("provider '{provider_name}' in models.json needs a baseUrl"))?;
     let api = config.api.or(provider.api).unwrap_or(Api::OpenAiCompletions);
-    let base_id = config.base.clone().unwrap_or_else(|| config.id.rsplit('/').next().unwrap_or(&config.id).to_string());
-    let inherited = builtin(&base_id);
-    if config.base.is_some() && inherited.is_none() {
-        bail!("model '{}' in provider '{provider_name}' names unknown base model '{base_id}'", config.id);
-    }
+    let inherited = match &config.base {
+        Some(base) => Some(builtin(base).ok_or_else(|| {
+            anyhow!("model '{}' in provider '{provider_name}' names unknown base model '{base}'", config.id)
+        })?),
+        None => inferred_builtin(&config.id),
+    };
 
     let reasoning = config.reasoning.unwrap_or(match (inherited, api) {
         (Some(b), Api::AnthropicMessages) => b.reasoning,
@@ -823,6 +832,10 @@ mod tests {
         assert_eq!(model.context_window, 1_000_000);
         assert!(model.images);
         assert_eq!(model.auth_header, AuthHeader::Bearer);
+
+        let config = ModelConfig { id: "us.anthropic.claude-sonnet-5-5".into(), ..Default::default() };
+        let model = resolve_custom_model("litellm", &provider, &config).unwrap();
+        assert_eq!(model.name, "Claude Sonnet 5.5");
 
         let config = ModelConfig { id: "gpt-x".into(), api: Some(Api::OpenAiCompletions), ..Default::default() };
         let model = resolve_custom_model("litellm", &provider, &config).unwrap();

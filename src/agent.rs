@@ -26,7 +26,7 @@ use crate::message::{
 };
 use crate::provider::{self, ErrorKind, Request, StreamDelta, ToolSpec};
 use crate::session::{Entry, SessionStore, iso_now, new_entry_id};
-use crate::tools::{FileLocks, ShellConfig, Tool, ToolContext, ToolOutput, UpdateFn};
+use crate::tools::{ShellConfig, Tool, ToolContext, ToolOutput, UpdateFn};
 
 // ---------------------------------------------------------------------------------------------
 // Events
@@ -165,7 +165,6 @@ struct Inner {
     setup: AgentSetup,
     client: reqwest::Client,
     shell: ShellConfig,
-    file_locks: Arc<FileLocks>,
     tool_specs: Vec<ToolSpec>,
     state: Mutex<State>,
     events: mpsc::UnboundedSender<AgentEvent>,
@@ -244,16 +243,7 @@ impl Agent {
         };
         let (idle, _) = watch::channel(true);
         let agent = Agent {
-            inner: Arc::new(Inner {
-                setup,
-                client,
-                shell,
-                file_locks: Arc::new(FileLocks::default()),
-                tool_specs,
-                state: Mutex::new(state),
-                events,
-                idle,
-            }),
+            inner: Arc::new(Inner { setup, client, shell, tool_specs, state: Mutex::new(state), events, idle }),
         };
         agent.record_model_if_changed()?;
         Ok(agent)
@@ -742,92 +732,80 @@ impl Agent {
         message
     }
 
-    /// Execute the tool calls of `assistant` concurrently. Results are returned in call order;
-    /// end events are emitted as tools finish.
+    /// Execute the tool calls of `assistant` in order. Consecutive read-only calls run
+    /// concurrently; every other call runs alone, so a command that depends on an earlier write or
+    /// edit in the same response sees its result. Results are returned in call order.
     async fn execute_tools(&self, assistant: &AssistantMessage, cancel: &CancellationToken) -> Vec<Message> {
-        let calls: Vec<(String, String, Value, Option<String>)> = assistant
+        let calls: Vec<PendingCall> = assistant
             .tool_calls()
-            .map(|c| {
-                (c.id.to_string(), c.name.to_string(), c.arguments.clone(), c.invalid_arguments.map(str::to_string))
+            .map(|c| PendingCall {
+                id: c.id.to_string(),
+                name: c.name.to_string(),
+                args: c.arguments.clone(),
+                invalid_arguments: c.invalid_arguments.map(str::to_string),
+                tool: self.inner.setup.tools.iter().find(|t| t.name() == c.name).cloned(),
             })
             .collect();
-        for (id, name, args, _) in &calls {
-            self.emit(AgentEvent::ToolExecutionStart {
-                tool_call_id: id.clone(),
-                tool_name: name.clone(),
-                args: args.clone(),
-            });
-        }
-
         let ctx = Arc::new(ToolContext {
             cwd: self.inner.setup.cwd.clone(),
             cancel: cancel.clone(),
-            file_locks: self.inner.file_locks.clone(),
             shell: self.inner.shell.clone(),
         });
         let truncated = assistant.stop_reason == StopReason::Length;
-        let mut running: FuturesUnordered<_> = calls
-            .iter()
-            .enumerate()
-            .map(|(index, (id, name, args, invalid))| {
-                let ctx = ctx.clone();
-                let tool = self.inner.setup.tools.iter().find(|t| t.name() == name).cloned();
-                let events = self.inner.events.clone();
-                let (id, name, args, invalid) = (id.clone(), name.clone(), args.clone(), invalid.clone());
-                async move {
-                    let started = Instant::now();
-                    let output = if let Some(raw) = invalid {
-                        let note = if truncated { " The response hit the output token limit before the call was complete." } else { "" };
-                        ToolOutput::error(format!(
-                            "{{\"INVALID_JSON\": {}}}\nThe tool arguments were not valid JSON, so the tool did not run.{note}",
-                            Value::String(raw)
-                        ))
-                    } else if ctx.cancel.is_cancelled() {
-                        ToolOutput::error("Operation aborted")
-                    } else if let Some(tool) = tool {
-                        let update: UpdateFn = {
-                            let (id, name) = (id.clone(), name.clone());
-                            Arc::new(move |partial: ToolOutput| {
-                                let _ = events.send(AgentEvent::ToolExecutionUpdate {
-                                    tool_call_id: id.clone(),
-                                    tool_name: name.clone(),
-                                    partial_result: ToolResultView::from(&partial),
-                                });
-                            })
-                        };
-                        match tool.execute(&ctx, args, update).await {
-                            Ok(output) => output,
-                            Err(err) => ToolOutput::error(format!("{err:#}")),
-                        }
-                    } else {
-                        ToolOutput::error(format!("Tool {name} not found"))
-                    };
-                    (index, output, started.elapsed())
-                }
-            })
-            .collect();
 
-        let mut results: Vec<Option<Message>> = vec![None; calls.len()];
-        while let Some((index, output, elapsed)) = running.next().await {
-            let (id, name, _, _) = &calls[index];
-            self.emit(AgentEvent::ToolExecutionEnd {
-                tool_call_id: id.clone(),
-                tool_name: name.clone(),
-                result: ToolResultView::from(&output),
-                is_error: output.is_error,
-                duration_ms: elapsed.as_millis() as u64,
-            });
-            results[index] = Some(Message::ToolResult(ToolResultMessage {
-                tool_call_id: id.clone(),
-                tool_name: name.clone(),
-                content: output.content,
-                is_error: output.is_error,
-                details: output.details,
-                timestamp: now_ms(),
-                duration_ms: Some(elapsed.as_millis() as u64),
-            }));
+        let mut results = Vec::with_capacity(calls.len());
+        let mut start = 0;
+        while start < calls.len() {
+            let end = if calls[start].concurrent() {
+                start + calls[start..].iter().take_while(|call| call.concurrent()).count()
+            } else {
+                start + 1
+            };
+            let batch = &calls[start..end];
+            for call in batch {
+                self.emit(AgentEvent::ToolExecutionStart {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    args: call.args.clone(),
+                });
+            }
+            let mut running: FuturesUnordered<_> = batch
+                .iter()
+                .enumerate()
+                .map(|(index, call)| {
+                    let ctx = ctx.clone();
+                    let events = self.inner.events.clone();
+                    async move {
+                        let started = Instant::now();
+                        let output = call.execute(&ctx, events, truncated).await;
+                        (index, output, started.elapsed())
+                    }
+                })
+                .collect();
+            let mut batch_results: Vec<Option<Message>> = vec![None; batch.len()];
+            while let Some((index, output, elapsed)) = running.next().await {
+                let call = &batch[index];
+                self.emit(AgentEvent::ToolExecutionEnd {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    result: ToolResultView::from(&output),
+                    is_error: output.is_error,
+                    duration_ms: elapsed.as_millis() as u64,
+                });
+                batch_results[index] = Some(Message::ToolResult(ToolResultMessage {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    content: output.content,
+                    is_error: output.is_error,
+                    details: output.details,
+                    timestamp: now_ms(),
+                    duration_ms: Some(elapsed.as_millis() as u64),
+                }));
+            }
+            results.extend(batch_results.into_iter().flatten());
+            start = end;
         }
-        results.into_iter().flatten().collect()
+        results
     }
 
     // --- Compaction ---------------------------------------------------------------------------
@@ -888,7 +866,13 @@ impl Agent {
             let plan = compaction::plan(&items, settings.keep_recent_tokens, previous_details.flatten().as_ref());
             (state.model.clone(), plan)
         };
-        let plan = plan.ok_or_else(|| anyhow!("nothing to compact"))?;
+        let plan = plan.ok_or_else(|| {
+            anyhow!(
+                "nothing to compact: the conversation fits within the {} most recent tokens that compaction keeps \
+                 (compaction.keepRecentTokens)",
+                settings.keep_recent_tokens
+            )
+        })?;
         let result =
             compaction::summarize(&self.inner.client, &model, &plan, instructions, settings.reserve_tokens, cancel)
                 .await
@@ -961,6 +945,60 @@ pub enum PromptDisposition {
     Queued(QueueMode),
 }
 
+/// A tool call from an assistant message, resolved to its tool.
+struct PendingCall {
+    id: String,
+    name: String,
+    args: Value,
+    /// Raw arguments text when it was not valid JSON.
+    invalid_arguments: Option<String>,
+    tool: Option<Arc<dyn Tool>>,
+}
+
+impl PendingCall {
+    /// Whether this call may run alongside others. Calls that cannot run (invalid arguments,
+    /// unknown tool) have no side effects.
+    fn concurrent(&self) -> bool {
+        self.invalid_arguments.is_some() || self.tool.as_ref().is_none_or(|tool| tool.read_only())
+    }
+
+    async fn execute(
+        &self,
+        ctx: &ToolContext,
+        events: mpsc::UnboundedSender<AgentEvent>,
+        truncated: bool,
+    ) -> ToolOutput {
+        if let Some(raw) = &self.invalid_arguments {
+            let note =
+                if truncated { " The response hit the output token limit before the call was complete." } else { "" };
+            return ToolOutput::error(format!(
+                "{{\"INVALID_JSON\": {}}}\nThe tool arguments were not valid JSON, so the tool did not run.{note}",
+                Value::String(raw.clone())
+            ));
+        }
+        if ctx.cancel.is_cancelled() {
+            return ToolOutput::error("Operation aborted");
+        }
+        let Some(tool) = &self.tool else {
+            return ToolOutput::error(format!("Tool {} not found", self.name));
+        };
+        let update: UpdateFn = {
+            let (id, name) = (self.id.clone(), self.name.clone());
+            Arc::new(move |partial: ToolOutput| {
+                let _ = events.send(AgentEvent::ToolExecutionUpdate {
+                    tool_call_id: id.clone(),
+                    tool_name: name.clone(),
+                    partial_result: ToolResultView::from(&partial),
+                });
+            })
+        };
+        match tool.execute(ctx, self.args.clone(), update).await {
+            Ok(output) => output,
+            Err(err) => ToolOutput::error(format!("{err:#}")),
+        }
+    }
+}
+
 /// Build user message content from text and images.
 pub fn user_content(text: &str, images: Vec<ContentBlock>) -> Vec<ContentBlock> {
     let mut content = Vec::with_capacity(images.len() + 1);
@@ -1011,14 +1049,25 @@ mod tests {
     }
 
     fn anthropic_tool_call(id: &str, command: &str) -> MockResponse {
-        MockResponse::anthropic(&[
-            json!({"type": "message_start", "message": {"usage": {"input_tokens": 100, "output_tokens": 1}}}),
-            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": id, "name": "bash", "input": {}}}),
-            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": json!({"command": command}).to_string()}}),
-            json!({"type": "content_block_stop", "index": 0}),
+        anthropic_tool_calls(&[(id, "bash", json!({"command": command}))])
+    }
+
+    /// One assistant response containing several tool calls of `(id, tool, arguments)`.
+    fn anthropic_tool_calls(calls: &[(&str, &str, Value)]) -> MockResponse {
+        let mut events =
+            vec![json!({"type": "message_start", "message": {"usage": {"input_tokens": 100, "output_tokens": 1}}})];
+        for (index, (id, name, args)) in calls.iter().enumerate() {
+            events.extend([
+                json!({"type": "content_block_start", "index": index, "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}}),
+                json!({"type": "content_block_delta", "index": index, "delta": {"type": "input_json_delta", "partial_json": args.to_string()}}),
+                json!({"type": "content_block_stop", "index": index}),
+            ]);
+        }
+        events.extend([
             json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 20}}),
             json!({"type": "message_stop"}),
-        ])
+        ]);
+        MockResponse::anthropic(&events)
     }
 
     fn anthropic_text(text: &str) -> MockResponse {
@@ -1099,6 +1148,39 @@ mod tests {
         assert_eq!(requests[0]["reasoning_effort"], json!("high"));
         assert_eq!(requests[1]["messages"][3]["role"], json!("tool"));
         assert_eq!(requests[1]["messages"][3]["content"], json!("hi"));
+    }
+
+    #[tokio::test]
+    async fn mutating_tool_calls_run_in_order() {
+        // The read must observe the file the slower bash call writes before it.
+        let server = MockServer::start(vec![
+            anthropic_tool_calls(&[
+                ("t1", "bash", json!({"command": "sleep 0.3 && printf written > out.txt"})),
+                ("t2", "read", json!({"path": "out.txt"})),
+                ("t3", "ls", json!({})),
+            ]),
+            anthropic_text("done"),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, mut events) = agent(model(&server.url, Api::AnthropicMessages), dir.path());
+        agent.prompt(vec![ContentBlock::text("go")], None).unwrap();
+        agent.wait_idle().await;
+
+        let messages = agent.messages();
+        let Message::ToolResult(read) = &messages[3] else { panic!("expected the read result") };
+        assert_eq!(crate::message::content_text(&read.content), "written");
+
+        let mut order = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            match event {
+                AgentEvent::ToolExecutionStart { tool_call_id, .. } => order.push(format!("start {tool_call_id}")),
+                AgentEvent::ToolExecutionEnd { tool_call_id, .. } => order.push(format!("end {tool_call_id}")),
+                _ => {}
+            }
+        }
+        assert_eq!(&order[..3], ["start t1", "end t1", "start t2"]);
+        assert_eq!(order[3], "start t3", "read-only calls start together");
     }
 
     #[tokio::test]

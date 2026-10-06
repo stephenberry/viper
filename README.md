@@ -46,7 +46,7 @@ Output flows into your terminal's normal scrollback, so scrolling, selection, an
 
 ## Tools
 
-`read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls`. Tool calls in one response run concurrently; writes to the same file are serialized. Output is truncated to 2000 lines or 50KB; truncated `bash` output is saved to a temp file whose path is given to the model. `grep` and `find` are built in (no ripgrep or fd needed) and respect `.gitignore`.
+`read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls`. Tool calls in one response run in order; consecutive read-only calls (`read`, `grep`, `find`, `ls`) run concurrently. Output is truncated to 2000 lines or 50KB; truncated `bash` output is saved to a temp file whose path is given to the model. `grep` and `find` are built in (no ripgrep or fd needed) and respect `.gitignore`.
 
 viper does not ask before running tools. Use it in a sandbox for untrusted work.
 
@@ -95,7 +95,9 @@ Add the gateway as a provider in `models.json`. Each model talks to the gateway 
 }
 ```
 
-Model ids that match a built-in Claude model (exactly, or after the last `/`, as in `anthropic/claude-opus-5-5`) inherit its context window, output limit, thinking support, image support, and prices. Use `base` to inherit from a built-in model under a different alias.
+Model ids that name a built-in Claude model inherit its context window, output limit, thinking support, image support, and prices. The id can match exactly, after the last `/` (`anthropic/claude-opus-5-5`), or after the last `.` (Bedrock's `us.anthropic.claude-opus-5-5`). Use `base` to inherit from a built-in model under a different alias. Fields you set override inherited ones, which matters when a gateway prices or limits a model differently.
+
+To reach the same gateway model through both endpoints, define two providers with the same `baseUrl` and `apiKey`, since a model is identified by provider and id.
 
 Provider fields: `baseUrl`, `apiKey`, `api` (`anthropic-messages` or `openai-completions`), `authHeader` (`bearer`, the default for custom providers, or `xapikey`), `headers`.
 

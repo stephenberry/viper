@@ -49,6 +49,10 @@ impl Tool for FindTool {
         "Find files by glob pattern (respects .gitignore)"
     }
 
+    fn read_only(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, ctx: &ToolContext, args: Value, _update: UpdateFn) -> anyhow::Result<ToolOutput> {
         let args: Args = parse_args("find", args)?;
         let root = resolve_path(args.path.as_deref().unwrap_or("."), &ctx.cwd);

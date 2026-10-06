@@ -45,6 +45,10 @@ impl Tool for LsTool {
         "List directory contents"
     }
 
+    fn read_only(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, ctx: &ToolContext, args: Value, _update: UpdateFn) -> anyhow::Result<ToolOutput> {
         let args: Args = parse_args("ls", args)?;
         let dir = resolve_path(args.path.as_deref().unwrap_or("."), &ctx.cwd);
