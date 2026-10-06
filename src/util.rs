@@ -1,51 +1,67 @@
 //! Small text helpers shared across modules.
 
-/// Remove ANSI escape sequences (CSI, OSC, and two-byte escapes) and normalize carriage
-/// returns so tool output is clean for the model and the terminal.
+/// A piece of terminal text: an escape sequence or a visible character.
+pub enum AnsiToken<'a> {
+    Escape(&'a str),
+    Char(char),
+}
+
+/// Split into escape sequences (CSI, OSC, and two-byte escapes) and visible characters.
+pub fn ansi_tokens(s: &str) -> impl Iterator<Item = AnsiToken<'_>> {
+    let mut rest = s;
+    std::iter::from_fn(move || {
+        let c = rest.chars().next()?;
+        if c == '\u{1b}' {
+            let bytes = rest.as_bytes();
+            let mut end = 1;
+            if bytes.get(1) == Some(&b'[') {
+                end = 2;
+                while end < bytes.len() && !(0x40..=0x7e).contains(&bytes[end]) {
+                    end += 1;
+                }
+                end = (end + 1).min(bytes.len());
+            } else if bytes.get(1) == Some(&b']') {
+                // OSC (e.g. hyperlinks) terminated by BEL or ESC \.
+                end = 2;
+                while end < bytes.len() {
+                    if bytes[end] == 0x07 {
+                        end += 1;
+                        break;
+                    }
+                    if bytes[end] == 0x1b && bytes.get(end + 1) == Some(&b'\\') {
+                        end += 2;
+                        break;
+                    }
+                    end += 1;
+                }
+            } else if bytes.len() > 1 {
+                end = 1 + rest[1..].chars().next().map(char::len_utf8).unwrap_or(0);
+            }
+            let (seq, tail) = rest.split_at(end);
+            rest = tail;
+            return Some(AnsiToken::Escape(seq));
+        }
+        rest = &rest[c.len_utf8()..];
+        Some(AnsiToken::Char(c))
+    })
+}
+
+/// Remove ANSI escape sequences and normalize carriage returns so tool output is clean for the
+/// model and the terminal.
 pub fn strip_ansi(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            match chars.peek() {
-                Some('[') => {
-                    chars.next();
-                    // Parameters and intermediates until a final byte in @..~.
-                    for c in chars.by_ref() {
-                        if ('@'..='~').contains(&c) {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    chars.next();
-                    // OSC terminated by BEL or ST (ESC \).
-                    while let Some(c) = chars.next() {
-                        if c == '\u{7}' {
-                            break;
-                        }
-                        if c == '\u{1b}' && chars.peek() == Some(&'\\') {
-                            chars.next();
-                            break;
-                        }
-                    }
-                }
-                Some(_) => {
-                    chars.next();
-                }
-                None => {}
-            }
-            continue;
-        }
-        if c == '\r' {
-            if chars.peek() == Some(&'\n') {
-                continue;
-            }
+    let mut tokens = ansi_tokens(input).peekable();
+    while let Some(token) = tokens.next() {
+        match token {
+            AnsiToken::Escape(_) => {}
             // A bare carriage return (progress bars) starts the line over; keep a newline instead.
-            out.push('\n');
-            continue;
+            AnsiToken::Char('\r') => {
+                if !matches!(tokens.peek(), Some(AnsiToken::Char('\n'))) {
+                    out.push('\n');
+                }
+            }
+            AnsiToken::Char(c) => out.push(c),
         }
-        out.push(c);
     }
     out
 }

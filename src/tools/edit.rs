@@ -10,17 +10,10 @@ pub struct EditTool;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct EditArg {
-    old_text: String,
-    new_text: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct Args {
     path: String,
     #[serde(default)]
-    edits: Vec<EditArg>,
+    edits: Vec<Edit>,
 }
 
 /// Accept common argument shapes models produce: `edits` as a JSON string or a single object,
@@ -119,9 +112,7 @@ impl Tool for EditTool {
         };
         let ending = edit_diff::detect_line_ending(content);
         let normalized = edit_diff::normalize_to_lf(content);
-        let edits: Vec<Edit> =
-            args.edits.into_iter().map(|e| Edit { old_text: e.old_text, new_text: e.new_text }).collect();
-        let new_content = edit_diff::apply_edits(&normalized, &edits, &args.path).map_err(anyhow::Error::msg)?;
+        let new_content = edit_diff::apply_edits(&normalized, &args.edits, &args.path).map_err(anyhow::Error::msg)?;
 
         let final_content = format!("{bom}{}", edit_diff::restore_line_endings(&new_content, ending));
         tokio::fs::write(&path, final_content)
@@ -130,7 +121,7 @@ impl Tool for EditTool {
 
         let (diff, first_changed_line) = edit_diff::display_diff(&normalized, &new_content, 4);
         let patch = edit_diff::unified_patch(&args.path, &normalized, &new_content);
-        Ok(ToolOutput::text(format!("Successfully replaced {} block(s) in {}.", edits.len(), args.path))
+        Ok(ToolOutput::text(format!("Successfully replaced {} block(s) in {}.", args.edits.len(), args.path))
             .with_details(json!({"diff": diff, "patch": patch, "firstChangedLine": first_changed_line})))
     }
 }

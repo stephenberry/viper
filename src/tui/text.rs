@@ -2,50 +2,7 @@
 
 use unicode_width::UnicodeWidthChar;
 
-enum Token<'a> {
-    Escape(&'a str),
-    Char(char),
-}
-
-/// Split into escape sequences and visible characters.
-fn tokens(s: &str) -> impl Iterator<Item = Token<'_>> {
-    let mut rest = s;
-    std::iter::from_fn(move || {
-        let c = rest.chars().next()?;
-        if c == '\u{1b}' {
-            let bytes = rest.as_bytes();
-            let mut end = 1;
-            if bytes.get(1) == Some(&b'[') {
-                end = 2;
-                while end < bytes.len() && !(0x40..=0x7e).contains(&bytes[end]) {
-                    end += 1;
-                }
-                end = (end + 1).min(bytes.len());
-            } else if bytes.get(1) == Some(&b']') {
-                // OSC (e.g. hyperlinks) terminated by BEL or ESC \.
-                end = 2;
-                while end < bytes.len() {
-                    if bytes[end] == 0x07 {
-                        end += 1;
-                        break;
-                    }
-                    if bytes[end] == 0x1b && bytes.get(end + 1) == Some(&b'\\') {
-                        end += 2;
-                        break;
-                    }
-                    end += 1;
-                }
-            } else if bytes.len() > 1 {
-                end = 1 + rest[1..].chars().next().map(char::len_utf8).unwrap_or(0);
-            }
-            let (seq, tail) = rest.split_at(end);
-            rest = tail;
-            return Some(Token::Escape(seq));
-        }
-        rest = &rest[c.len_utf8()..];
-        Some(Token::Char(c))
-    })
-}
+use crate::util::{AnsiToken, ansi_tokens};
 
 pub fn char_width(c: char) -> usize {
     if c == '\t' { 4 } else { c.width().unwrap_or(0) }
@@ -53,7 +10,7 @@ pub fn char_width(c: char) -> usize {
 
 /// Terminal columns occupied by `s`, ignoring escape sequences.
 pub fn visible_width(s: &str) -> usize {
-    tokens(s).map(|t| if let Token::Char(c) = t { char_width(c) } else { 0 }).sum()
+    ansi_tokens(s).map(|t| if let AnsiToken::Char(c) = t { char_width(c) } else { 0 }).sum()
 }
 
 fn is_reset(seq: &str) -> bool {
@@ -94,9 +51,9 @@ pub fn wrap(line: &str, width: usize) -> Vec<String> {
     // it, style after it).
     let mut breakpoint: Option<(usize, usize, usize, String)> = None;
 
-    for token in tokens(line) {
+    for token in ansi_tokens(line) {
         match token {
-            Token::Escape(seq) => {
+            AnsiToken::Escape(seq) => {
                 current.push_str(seq);
                 if is_reset(seq) {
                     style.clear();
@@ -104,7 +61,7 @@ pub fn wrap(line: &str, width: usize) -> Vec<String> {
                     style.push_str(seq);
                 }
             }
-            Token::Char(c) => {
+            AnsiToken::Char(c) => {
                 if c.is_control() && c != '\t' {
                     continue;
                 }
@@ -164,10 +121,10 @@ pub fn truncate(s: &str, width: usize) -> String {
     }
     let mut out = String::new();
     let mut used = 0;
-    for token in tokens(s) {
+    for token in ansi_tokens(s) {
         match token {
-            Token::Escape(seq) => out.push_str(seq),
-            Token::Char(c) => {
+            AnsiToken::Escape(seq) => out.push_str(seq),
+            AnsiToken::Char(c) => {
                 let w = char_width(c);
                 if used + w + 1 > width {
                     break;

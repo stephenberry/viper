@@ -12,28 +12,27 @@ use tokio_util::sync::CancellationToken;
 
 use super::truncate::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, Truncation, truncate_tail};
 
-/// How commands are run: `program args... <command>`.
+/// The shell commands run in, as `program -c <command>`.
 #[derive(Debug, Clone)]
 pub struct ShellConfig {
     pub program: PathBuf,
-    pub args: Vec<String>,
 }
 
 impl ShellConfig {
     /// Use the configured shell, else bash, else sh.
     pub fn resolve(configured: Option<&str>) -> ShellConfig {
         if let Some(path) = configured.filter(|p| !p.trim().is_empty()) {
-            return ShellConfig { program: crate::config::expand_home(path), args: vec!["-c".into()] };
+            return ShellConfig { program: crate::config::expand_home(path) };
         }
         if cfg!(windows) {
-            return ShellConfig { program: PathBuf::from("bash"), args: vec!["-c".into()] };
+            return ShellConfig { program: PathBuf::from("bash") };
         }
         for candidate in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash", "/opt/homebrew/bin/bash"] {
             if Path::new(candidate).exists() {
-                return ShellConfig { program: PathBuf::from(candidate), args: vec!["-c".into()] };
+                return ShellConfig { program: PathBuf::from(candidate) };
             }
         }
-        ShellConfig { program: PathBuf::from("/bin/sh"), args: vec!["-c".into()] }
+        ShellConfig { program: PathBuf::from("/bin/sh") }
     }
 }
 
@@ -155,7 +154,7 @@ pub async fn run_shell_command(
         anyhow::bail!("Working directory does not exist: {}", cwd.display());
     }
     let mut cmd = tokio::process::Command::new(&shell.program);
-    cmd.args(&shell.args)
+    cmd.arg("-c")
         .arg(command)
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -195,7 +194,6 @@ pub async fn run_shell_command(
     drop(tx);
 
     let mut output = OutputAccumulator::new();
-    let mut last_update = Instant::now() - UPDATE_INTERVAL;
     let mut dirty = false;
     let deadline = timeout.map(|t| tokio::time::Instant::now() + t);
     let mut cancelled = false;
@@ -221,12 +219,13 @@ pub async fn run_shell_command(
                 if let Some(pid) = pid { kill_process_group(pid); }
                 let _ = child.start_kill();
             }
-            _ = ticker.tick() => {}
-        }
-        if dirty && last_update.elapsed() >= UPDATE_INTERVAL {
-            on_update(&output.snapshot());
-            last_update = Instant::now();
-            dirty = false;
+            // Report new output at most once per interval.
+            _ = ticker.tick() => {
+                if dirty {
+                    on_update(&output.snapshot());
+                    dirty = false;
+                }
+            }
         }
     };
 

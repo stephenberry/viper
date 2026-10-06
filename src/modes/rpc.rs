@@ -30,7 +30,7 @@ enum Command {
         message: String,
         #[serde(default)]
         images: Vec<ImageInput>,
-        streaming_behavior: Option<StreamingBehavior>,
+        streaming_behavior: Option<QueueMode>,
     },
     Steer {
         message: String,
@@ -89,18 +89,12 @@ enum Command {
     GetCommands,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "camelCase")]
-enum StreamingBehavior {
-    Steer,
-    FollowUp,
-}
-
 fn content(message: String, images: Vec<ImageInput>) -> Vec<ContentBlock> {
     let images = images.into_iter().map(|i| ContentBlock::Image { data: i.data, mime_type: i.mime_type }).collect();
     crate::agent::user_content(&message, images)
 }
 
+#[derive(Clone)]
 struct Responder {
     out: mpsc::UnboundedSender<String>,
 }
@@ -151,7 +145,7 @@ pub async fn run(agent: Agent, mut events: mpsc::UnboundedReceiver<AgentEvent>) 
         }
     });
 
-    let responder = std::sync::Arc::new(Responder { out: out_tx });
+    let responder = Responder { out: out_tx };
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     while let Some(line) = lines.next_line().await.context("could not read stdin")? {
         if line.trim().is_empty() {
@@ -186,17 +180,13 @@ pub async fn run(agent: Agent, mut events: mpsc::UnboundedReceiver<AgentEvent>) 
     Ok(ExitCode::SUCCESS)
 }
 
-fn handle(agent: &Agent, responder: &std::sync::Arc<Responder>, id: Option<Value>, name: &str, command: Command) {
+fn handle(agent: &Agent, responder: &Responder, id: Option<Value>, name: &str, command: Command) {
     let reply = |result: Result<Option<Value>>| responder.reply(&id, name, result);
     match command {
         Command::Prompt { message, images, streaming_behavior } => {
-            let mode = streaming_behavior.map(|b| match b {
-                StreamingBehavior::Steer => QueueMode::Steer,
-                StreamingBehavior::FollowUp => QueueMode::FollowUp,
-            });
             reply(
                 super::expand_skill(agent, content(message, images))
-                    .and_then(|c| agent.prompt(c, mode))
+                    .and_then(|c| agent.prompt(c, streaming_behavior))
                     .map(|d| Some(json!({"disposition": d}))),
             );
         }
@@ -214,7 +204,7 @@ fn handle(agent: &Agent, responder: &std::sync::Arc<Responder>, id: Option<Value
             let (steering, follow_up) = agent.clear_queue();
             reply(Ok(Some(json!({"steering": steering, "followUp": follow_up}))));
         }
-        Command::NewSession => reply(agent.new_session(true).map(|_| Some(json!(agent.snapshot())))),
+        Command::NewSession => reply(agent.new_session().map(|_| Some(json!(agent.snapshot())))),
         Command::GetState => reply(Ok(Some(json!(agent.snapshot())))),
         Command::SetModel { provider, model_id } => reply(
             agent
@@ -231,13 +221,16 @@ fn handle(agent: &Agent, responder: &std::sync::Arc<Responder>, id: Option<Value
             reply(agent.cycle_thinking().map(|l| Some(json!(l.map(|level| json!({"level": level}))))))
         }
         Command::GetAvailableThinkingLevels => reply(Ok(Some(json!({"levels": agent.model().thinking_levels})))),
-        Command::Compact { custom_instructions } => {
-            let (agent, responder, name) = (agent.clone(), responder.clone(), name.to_string());
-            tokio::spawn(async move {
-                let result = agent.compact(custom_instructions.as_deref()).await.map(|r| Some(json!(r)));
-                responder.reply(&id, &name, result);
-            });
-        }
+        Command::Compact { custom_instructions } => match agent.compact(custom_instructions) {
+            Ok(task) => {
+                let (responder, name) = (responder.clone(), name.to_string());
+                tokio::spawn(async move {
+                    let result = task.await.unwrap_or_else(|err| Err(anyhow!("compaction task failed: {err}")));
+                    responder.reply(&id, &name, result.map(|r| Some(json!(r))));
+                });
+            }
+            Err(err) => reply(Err(err)),
+        },
         Command::SetAutoCompaction { enabled } => {
             agent.set_auto_compaction(enabled);
             reply(Ok(None));

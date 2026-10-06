@@ -108,9 +108,9 @@ pub fn session_dir_for(cwd: &Path) -> PathBuf {
 pub struct SessionStore {
     header: SessionHeader,
     entries: Vec<Entry>,
+    /// Where the session is saved; `None` keeps it in memory.
     path: Option<PathBuf>,
     file: Option<File>,
-    persist: bool,
 }
 
 impl SessionStore {
@@ -126,7 +126,7 @@ impl SessionStore {
             let stamp = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S-%3fZ");
             session_dir_for(cwd).join(format!("{stamp}_{}.jsonl", header.id))
         });
-        SessionStore { header, entries: Vec::new(), path, file: None, persist }
+        SessionStore { header, entries: Vec::new(), path, file: None }
     }
 
     /// Open an existing session file. Malformed lines are skipped with a warning.
@@ -151,10 +151,7 @@ impl SessionStore {
             .append(true)
             .open(path)
             .with_context(|| format!("could not open {} for writing", path.display()))?;
-        Ok((
-            SessionStore { header, entries, path: Some(path.to_path_buf()), file: Some(file), persist: true },
-            warnings,
-        ))
+        Ok((SessionStore { header, entries, path: Some(path.to_path_buf()), file: Some(file) }, warnings))
     }
 
     pub fn id(&self) -> &str {
@@ -181,9 +178,7 @@ impl SessionStore {
     pub fn append(&mut self, entry: Entry) -> Result<()> {
         let is_message = matches!(entry, Entry::Message { .. });
         self.entries.push(entry);
-        if !self.persist {
-            return Ok(());
-        }
+        let Some(path) = &self.path else { return Ok(()) };
         if let Some(file) = &mut self.file {
             Self::write_line(file, self.entries.last().expect("entry was just pushed"))?;
             return file.flush().context("could not write session file");
@@ -191,14 +186,13 @@ impl SessionStore {
         if !is_message {
             return Ok(());
         }
-        let path = self.path.clone().expect("persistent sessions have a path");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| format!("could not create {}", parent.display()))?;
         }
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&path)
+            .open(path)
             .with_context(|| format!("could not create session file {}", path.display()))?;
         Self::write_line(&mut file, &Entry::Session(self.header.clone()))?;
         for entry in &self.entries {
@@ -338,26 +332,26 @@ fn summarize(path: &Path) -> Option<SessionSummary> {
     })
 }
 
-/// Sessions saved for `cwd`, most recently modified first.
-pub fn list_sessions(cwd: &Path) -> Vec<SessionSummary> {
-    let Ok(entries) = std::fs::read_dir(session_dir_for(cwd)) else { return Vec::new() };
-    let mut sessions: Vec<SessionSummary> = entries
+/// Session files saved for `cwd`, in no particular order.
+fn session_files(cwd: &Path) -> impl Iterator<Item = PathBuf> {
+    std::fs::read_dir(session_dir_for(cwd))
+        .into_iter()
+        .flatten()
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
-        .filter_map(|p| summarize(&p))
-        .collect();
+}
+
+/// Sessions saved for `cwd`, most recently modified first.
+pub fn list_sessions(cwd: &Path) -> Vec<SessionSummary> {
+    let mut sessions: Vec<SessionSummary> = session_files(cwd).filter_map(|p| summarize(&p)).collect();
     sessions.sort_by_key(|s| std::cmp::Reverse(s.modified));
     sessions
 }
 
 /// The most recently modified session for `cwd`.
 pub fn most_recent_session(cwd: &Path) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(session_dir_for(cwd)).ok()?;
-    entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
+    session_files(cwd)
         .filter_map(|p| Some((std::fs::metadata(&p).and_then(|m| m.modified()).ok()?, p)))
         .max_by_key(|(modified, _)| *modified)
         .map(|(_, path)| path)
@@ -411,7 +405,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.jsonl");
         let mut store = in_memory();
-        store.persist = true;
         store.path = Some(path.clone());
         store
             .append(Entry::ModelChange {

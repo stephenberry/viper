@@ -5,9 +5,11 @@
 //! normalized space and only the lines it touches are rewritten; all other lines keep their
 //! original bytes.
 
+use serde::Deserialize;
 use similar::{ChangeTag, TextDiff};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Edit {
     pub old_text: String,
     pub new_text: String,
@@ -147,10 +149,6 @@ fn apply_preserving_unchanged_lines(
     Ok(result)
 }
 
-fn count_occurrences(haystack: &str, needle: &str) -> usize {
-    haystack.matches(needle).count()
-}
-
 /// Apply `edits` to LF-normalized `content`. Returns the new content or an error for the model.
 pub fn apply_edits(content: &str, edits: &[Edit], path: &str) -> Result<String, String> {
     let total = edits.len();
@@ -158,17 +156,13 @@ pub fn apply_edits(content: &str, edits: &[Edit], path: &str) -> Result<String, 
         .iter()
         .map(|e| Edit { old_text: normalize_to_lf(&e.old_text), new_text: normalize_to_lf(&e.new_text) })
         .collect();
-    let label = |i: usize, single: &str, many: &str| {
-        if total == 1 { single.to_string() } else { many.replace("{i}", &i.to_string()) }
-    };
-
     for (i, edit) in edits.iter().enumerate() {
         if edit.old_text.is_empty() {
-            return Err(label(
-                i,
-                &format!("oldText must not be empty in {path}."),
-                &format!("edits[{{i}}].oldText must not be empty in {path}."),
-            ));
+            return Err(if total == 1 {
+                format!("oldText must not be empty in {path}.")
+            } else {
+                format!("edits[{i}].oldText must not be empty in {path}.")
+            });
         }
     }
 
@@ -189,27 +183,27 @@ pub fn apply_edits(content: &str, edits: &[Edit], path: &str) -> Result<String, 
             edit.old_text.clone()
         };
         let Some(start) = base.find(&needle) else {
-            return Err(label(
-                i,
-                &format!(
+            return Err(if total == 1 {
+                format!(
                     "Could not find the exact text in {path}. The old text must match exactly including all whitespace and newlines."
-                ),
-                &format!(
-                    "Could not find edits[{{i}}] in {path}. The oldText must match exactly including all whitespace and newlines."
-                ),
-            ));
+                )
+            } else {
+                format!(
+                    "Could not find edits[{i}] in {path}. The oldText must match exactly including all whitespace and newlines."
+                )
+            });
         };
-        let occurrences = count_occurrences(base, &needle);
+        let occurrences = base.matches(&needle).count();
         if occurrences > 1 {
-            return Err(label(
-                i,
-                &format!(
+            return Err(if total == 1 {
+                format!(
                     "Found {occurrences} occurrences of the text in {path}. The text must be unique. Please provide more context to make it unique."
-                ),
-                &format!(
-                    "Found {occurrences} occurrences of edits[{{i}}] in {path}. Each oldText must be unique. Please provide more context to make it unique."
-                ),
-            ));
+                )
+            } else {
+                format!(
+                    "Found {occurrences} occurrences of edits[{i}] in {path}. Each oldText must be unique. Please provide more context to make it unique."
+                )
+            });
         }
         replacements.push(Replacement { edit_index: i, start, len: needle.len(), new_text: edit.new_text.clone() });
     }
@@ -263,16 +257,12 @@ pub fn display_diff(old: &str, new: &str, context: usize) -> (String, Option<usi
                     }
                     ChangeTag::Delete => {
                         let n = change.old_index().unwrap_or(0) + 1;
-                        if first_changed.is_none() {
-                            first_changed = Some(change.old_index().unwrap_or(0) + 1);
-                        }
+                        first_changed.get_or_insert(n);
                         out.push(format!("-{n:>width$} {line}"));
                     }
                     ChangeTag::Insert => {
                         let n = change.new_index().unwrap_or(0) + 1;
-                        if first_changed.is_none() {
-                            first_changed = Some(n);
-                        }
+                        first_changed.get_or_insert(n);
                         out.push(format!("+{n:>width$} {line}"));
                     }
                 }

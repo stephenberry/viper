@@ -62,7 +62,7 @@ impl Tool for BashTool {
         })
         .await?;
 
-        let mut text = if result.output.is_empty() { String::new() } else { result.output.clone() };
+        let mut text = result.output;
         let t = &result.truncation;
         if t.truncated {
             let path = result
@@ -91,27 +91,24 @@ impl Tool for BashTool {
             "truncation": t.truncated.then_some(t),
             "fullOutputPath": result.full_output_path,
         });
-        let with_status =
-            |text: String, status: String| if text.is_empty() { status } else { format!("{text}\n\n{status}") };
-
-        if result.cancelled {
-            return Ok(ToolOutput::error(with_status(text, "Command aborted".into())).with_details(details));
-        }
-        if result.timed_out {
-            let secs = args.timeout.unwrap_or_default();
-            return Ok(ToolOutput::error(with_status(text, format!("Command timed out after {secs} seconds")))
-                .with_details(details));
-        }
-        match result.exit_code {
-            Some(0) => {
-                Ok(ToolOutput::text(if text.is_empty() { "(no output)".into() } else { text }).with_details(details))
+        // A failed command reports why after its output.
+        let failure = if result.cancelled {
+            Some("Command aborted".to_string())
+        } else if result.timed_out {
+            Some(format!("Command timed out after {} seconds", args.timeout.unwrap_or_default()))
+        } else {
+            match result.exit_code {
+                Some(0) => None,
+                Some(code) => Some(format!("Command exited with code {code}")),
+                None => Some("Command terminated without an exit code".to_string()),
             }
-            Some(code) => {
-                Ok(ToolOutput::error(with_status(text, format!("Command exited with code {code}")))
-                    .with_details(details))
-            }
-            None => Ok(ToolOutput::error(with_status(text, "Command terminated without an exit code".into()))
-                .with_details(details)),
-        }
+        };
+        let output = match failure {
+            None if text.is_empty() => ToolOutput::text("(no output)"),
+            None => ToolOutput::text(text),
+            Some(status) if text.is_empty() => ToolOutput::error(status),
+            Some(status) => ToolOutput::error(format!("{text}\n\n{status}")),
+        };
+        Ok(output.with_details(details))
     }
 }

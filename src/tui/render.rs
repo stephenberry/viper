@@ -5,8 +5,8 @@ use serde_json::Value;
 use super::markdown::MarkdownRenderer;
 use super::style::*;
 use super::text::sanitize;
-use crate::agent::ToolResultView;
 use crate::message::{AssistantMessage, BashExecutionMessage, ContentBlock, Message, StopReason, content_text};
+use crate::tools::ToolOutput;
 
 /// A logical line plus the prefixes used when it wraps.
 #[derive(Debug, Clone)]
@@ -27,6 +27,8 @@ impl Line {
 }
 
 pub const BODY_FIRST: &str = "  ⎿ ";
+/// The cyan `›` marking the editor and user messages (`CYAN`, `›`, `RESET`, space).
+pub const PROMPT_PREFIX: &str = "\u{1b}[36m›\u{1b}[0m ";
 pub const BODY_REST: &str = "    ";
 
 pub fn user_lines(content: &[ContentBlock]) -> Vec<Line> {
@@ -35,16 +37,19 @@ pub fn user_lines(content: &[ContentBlock]) -> Vec<Line> {
     let mut lines: Vec<Line> = text
         .lines()
         .enumerate()
-        .map(|(i, l)| {
-            Line::indented(format!("{BOLD}{l}{RESET}"), if i == 0 { "\u{1b}[36m›\u{1b}[0m " } else { "  " }, "  ")
-        })
+        .map(|(i, l)| Line::indented(format!("{BOLD}{l}{RESET}"), if i == 0 { PROMPT_PREFIX } else { "  " }, "  "))
         .collect();
     if images > 0 {
         let label = if images == 1 { "[1 image]".to_string() } else { format!("[{images} images]") };
-        let prefix = if lines.is_empty() { "\u{1b}[36m›\u{1b}[0m " } else { "  " };
+        let prefix = if lines.is_empty() { PROMPT_PREFIX } else { "  " };
         lines.push(Line::indented(dim(&label), prefix, "  "));
     }
     lines
+}
+
+/// Placeholder shown for thinking that is hidden or redacted.
+pub fn hidden_thinking() -> String {
+    format!("{GRAY}{ITALIC}∴ Thinking…{RESET}")
 }
 
 pub fn thinking_lines(text: &str) -> Vec<Line> {
@@ -168,10 +173,10 @@ fn diff_lines(diff: &str, max: usize) -> Vec<String> {
 }
 
 /// Body lines for a finished tool call.
-pub fn tool_body(name: &str, args: &Value, result: &ToolResultView, is_error: bool, max_lines: usize) -> Vec<Line> {
+pub fn tool_body(name: &str, args: &Value, result: &ToolOutput, max_lines: usize) -> Vec<Line> {
     let text = content_text(&result.content);
     let images = result.content.iter().filter(|b| matches!(b, ContentBlock::Image { .. })).count();
-    if is_error {
+    if result.is_error {
         return body(limited(&text, max_lines, name == "bash", RED));
     }
     let details = result.details.as_ref();
@@ -243,7 +248,7 @@ pub fn assistant_lines(message: &AssistantMessage, hide_thinking: bool) -> Vec<L
             ContentBlock::Thinking { thinking, redacted, .. } if !thinking.trim().is_empty() => {
                 lines.push(Line::plain(""));
                 if hide_thinking || *redacted {
-                    lines.push(Line::indented(format!("{GRAY}{ITALIC}∴ Thinking…{RESET}"), "", ""));
+                    lines.push(Line::plain(hidden_thinking()));
                 } else {
                     lines.extend(thinking_lines(thinking.trim_end()));
                 }
@@ -282,8 +287,12 @@ pub fn transcript_lines(messages: &[Message], hide_thinking: bool, max_tool_line
                 let state = if result.is_error { ToolState::Failed } else { ToolState::Done };
                 lines.push(Line::plain(""));
                 lines.push(tool_header(&name, &args, state, ""));
-                let view = ToolResultView { content: result.content.clone(), details: result.details.clone() };
-                lines.extend(tool_body(&name, &args, &view, result.is_error, max_tool_lines));
+                let output = ToolOutput {
+                    content: result.content.clone(),
+                    details: result.details.clone(),
+                    is_error: result.is_error,
+                };
+                lines.extend(tool_body(&name, &args, &output, max_tool_lines));
             }
             Message::BashExecution(bash) => {
                 lines.push(Line::plain(""));

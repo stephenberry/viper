@@ -88,9 +88,6 @@ pub fn truncate_head(content: &str, max_lines: usize, max_bytes: usize) -> Trunc
         bytes += line_bytes;
         kept += 1;
     }
-    if kept >= max_lines && bytes <= max_bytes {
-        truncated_by = TruncatedBy::Lines;
-    }
     let output = lines[..kept].join("\n");
     Truncation {
         output_bytes: output.len(),
@@ -124,18 +121,13 @@ pub fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -> Trunc
         if bytes + line_bytes > max_bytes {
             truncated_by = TruncatedBy::Bytes;
             if kept.is_empty() {
-                let tail = tail_bytes(line, max_bytes);
-                bytes = tail.len();
-                kept.push(tail.to_string());
+                kept.push(tail_bytes(line, max_bytes).to_string());
                 last_line_partial = true;
             }
             break;
         }
         bytes += line_bytes;
         kept.push(line.to_string());
-    }
-    if kept.len() >= max_lines && bytes <= max_bytes {
-        truncated_by = TruncatedBy::Lines;
     }
     kept.reverse();
     let output = kept.join("\n");

@@ -1,14 +1,14 @@
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use globset::GlobMatcher;
 use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
+use super::listing::{GlobFilter, listing_text, walker};
 use super::path::resolve_path;
-use super::truncate::{DEFAULT_MAX_BYTES, GREP_MAX_LINE_CHARS, format_size, truncate_head, truncate_line};
+use super::truncate::{DEFAULT_MAX_BYTES, GREP_MAX_LINE_CHARS, truncate_line};
 use super::{Tool, ToolContext, ToolOutput, UpdateFn, parse_args};
 
 pub struct GrepTool;
@@ -31,38 +31,11 @@ struct Args {
     limit: Option<usize>,
 }
 
-/// Build a walker over `root` that respects ignore files, includes dotfiles, and skips `.git`.
-pub(super) fn walker(root: &Path) -> ignore::Walk {
-    ignore::WalkBuilder::new(root)
-        .hidden(false)
-        .require_git(false)
-        .filter_entry(|entry| entry.file_name() != ".git")
-        .sort_by_file_path(|a, b| a.cmp(b))
-        .build()
-}
-
-/// Compile a glob filter. Patterns without `/` match file names; others match relative paths.
-pub(super) fn glob_filter(pattern: &str) -> anyhow::Result<(GlobMatcher, bool)> {
-    let glob = globset::GlobBuilder::new(pattern)
-        .literal_separator(false)
-        .build()
-        .map_err(|err| anyhow::anyhow!("Invalid glob '{pattern}': {err}"))?;
-    Ok((glob.compile_matcher(), pattern.contains('/')))
-}
-
-pub(super) fn glob_matches(matcher: &(GlobMatcher, bool), relative: &Path) -> bool {
-    if matcher.1 {
-        matcher.0.is_match(relative)
-    } else {
-        relative.file_name().is_some_and(|name| matcher.0.is_match(name))
-    }
-}
-
 struct Search {
     regex: Regex,
     context: usize,
     limit: usize,
-    glob: Option<(GlobMatcher, bool)>,
+    glob: Option<GlobFilter>,
 }
 
 struct SearchResult {
@@ -134,7 +107,7 @@ fn run(search: Search, root: PathBuf, cancel: CancellationToken) -> anyhow::Resu
         }
         let relative = entry.path().strip_prefix(&root).unwrap_or(entry.path());
         if let Some(glob) = &search.glob
-            && !glob_matches(glob, relative)
+            && !glob.matches(relative)
         {
             continue;
         }
@@ -202,7 +175,7 @@ impl Tool for GrepTool {
             regex,
             context: args.context.unwrap_or(0),
             limit,
-            glob: args.glob.as_deref().map(glob_filter).transpose()?,
+            glob: args.glob.as_deref().map(GlobFilter::new).transpose()?,
         };
         let cancel = ctx.cancel.clone();
         let result = tokio::task::spawn_blocking(move || run(search, root, cancel)).await??;
@@ -210,22 +183,14 @@ impl Tool for GrepTool {
         if result.matches == 0 {
             return Ok(ToolOutput::text("No matches found"));
         }
-        let truncation = truncate_head(&result.lines.join("\n"), usize::MAX, DEFAULT_MAX_BYTES);
-        let mut text = truncation.content.clone();
         let mut notes = Vec::new();
         if result.limit_reached {
             notes.push(format!("{limit} matches limit reached. Use limit={} for more, or refine pattern", limit * 2));
         }
-        if truncation.truncated {
-            notes.push(format!("{} limit reached", format_size(DEFAULT_MAX_BYTES)));
-        }
         if result.lines_truncated {
             notes.push(format!("Some lines truncated to {GREP_MAX_LINE_CHARS} chars. Use read to see full lines"));
         }
-        if !notes.is_empty() {
-            text.push_str(&format!("\n\n[{}]", notes.join(". ")));
-        }
-        Ok(ToolOutput::text(text)
+        Ok(ToolOutput::text(listing_text(&result.lines, notes))
             .with_details(json!({"matches": result.matches, "limitReached": result.limit_reached})))
     }
 }

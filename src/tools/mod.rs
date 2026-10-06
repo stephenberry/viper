@@ -5,6 +5,7 @@ mod edit;
 mod edit_diff;
 mod find;
 mod grep;
+mod listing;
 mod ls;
 mod path;
 mod read;
@@ -16,6 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -23,13 +25,15 @@ use tokio_util::sync::CancellationToken;
 use crate::message::ContentBlock;
 use crate::provider::ToolSpec;
 
-/// Result of a tool execution.
-#[derive(Debug, Clone)]
+/// Result of a tool execution. Events carry `is_error` beside it, so it is not serialized.
+#[derive(Debug, Clone, Serialize)]
 pub struct ToolOutput {
     /// Content returned to the model.
     pub content: Vec<ContentBlock>,
     /// Structured data for the UI and JSON/RPC consumers.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
+    #[serde(skip)]
     pub is_error: bool,
 }
 

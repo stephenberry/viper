@@ -17,7 +17,7 @@ use std::str::FromStr;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 // ---------------------------------------------------------------------------------------------
 // Paths
@@ -54,34 +54,24 @@ pub fn save_login(provider: &str, base_url: Option<&str>) -> Result<()> {
 }
 
 fn save_login_to(path: &Path, provider: &str, base_url: Option<&str>) -> Result<()> {
-    let mut root = read_json_file(path)?.unwrap_or_else(|| Value::Object(Default::default()));
-    let invalid = || anyhow!("{} has an unexpected shape: providers must be objects", path.display());
-    let Value::Object(root_map) = &mut root else { return Err(invalid()) };
-    let Value::Object(providers) = root_map.entry("providers").or_insert_with(|| Value::Object(Default::default()))
-    else {
-        return Err(invalid());
-    };
-    let Value::Object(entry) = providers.entry(provider).or_insert_with(|| Value::Object(Default::default())) else {
-        return Err(invalid());
-    };
-    if let Some(url) = base_url {
-        entry.insert("baseUrl".into(), Value::String(url.to_string()));
-    }
-    let literal_key = entry
-        .get("apiKey")
-        .and_then(Value::as_str)
-        .is_some_and(|key| matches!(ConfigValue::parse(key), ConfigValue::Literal(_)));
-    if literal_key {
-        entry.remove("apiKey");
-    }
-    if entry.is_empty() {
-        providers.remove(provider);
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, serde_json::to_string_pretty(&root)? + "\n")
-        .with_context(|| format!("failed to write {}", path.display()))
+    update_json_object(path, |root| {
+        let providers = object_entry(root, "providers")?;
+        let entry = object_entry(providers, provider)?;
+        if let Some(url) = base_url {
+            entry.insert("baseUrl".into(), Value::String(url.to_string()));
+        }
+        let literal_key = entry
+            .get("apiKey")
+            .and_then(Value::as_str)
+            .is_some_and(|key| matches!(ConfigValue::parse(key), ConfigValue::Literal(_)));
+        if literal_key {
+            entry.remove("apiKey");
+        }
+        if entry.is_empty() {
+            providers.remove(provider);
+        }
+        Ok(())
+    })
 }
 
 /// Expand a leading `~` to the home directory.
@@ -106,6 +96,29 @@ fn read_json_file(path: &Path) -> Result<Option<Value>> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err).with_context(|| format!("failed to read {}", path.display())),
     }
+}
+
+/// Update the JSON object in `path`, keeping whatever `update` leaves alone. A missing file
+/// starts as `{}`.
+fn update_json_object(path: &Path, update: impl FnOnce(&mut Map<String, Value>) -> Result<()>) -> Result<()> {
+    let mut value = read_json_file(path)?.unwrap_or_else(|| Value::Object(Map::new()));
+    let Value::Object(map) = &mut value else {
+        bail!("{} must contain a JSON object", path.display());
+    };
+    update(map).with_context(|| format!("could not update {}", path.display()))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&value)? + "\n")
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+/// The object stored at `key`, created when missing.
+fn object_entry<'a>(map: &'a mut Map<String, Value>, key: &str) -> Result<&'a mut Map<String, Value>> {
+    map.entry(key)
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .with_context(|| format!("\"{key}\" must be a JSON object"))
 }
 
 /// Recursively merge `overlay` into `base`; objects merge by key, everything else is replaced.
@@ -183,8 +196,6 @@ impl FromStr for ThinkingLevel {
 // ---------------------------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------------------------
-
-pub const DEFAULT_TOOLS: [&str; 7] = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -292,7 +303,7 @@ impl Default for Settings {
         Self {
             default_model: None,
             default_thinking_level: None,
-            tools: DEFAULT_TOOLS.iter().map(|s| s.to_string()).collect(),
+            tools: crate::tools::all_tools().iter().map(|tool| tool.name().to_string()).collect(),
             compaction: CompactionSettings::default(),
             retry: RetrySettings::default(),
             shell_path: None,
@@ -321,18 +332,14 @@ impl Settings {
 
     /// Persist a model's auto-compact window in the global settings (`None` removes it).
     pub fn save_auto_compact_window(model_key: &str, window: Option<u64>) -> Result<()> {
-        Settings::save_global(|map| {
-            let models = map.entry("modelSettings").or_insert_with(|| Value::Object(Default::default()));
-            let Value::Object(models) = models else { return };
+        update_json_object(&settings_path(), |map| {
+            let models = object_entry(map, "modelSettings")?;
             match window {
                 Some(window) => {
-                    let entry = models.entry(model_key).or_insert_with(|| Value::Object(Default::default()));
-                    if let Value::Object(entry) = entry {
-                        entry.insert("autoCompactWindow".into(), Value::from(window));
-                    }
+                    object_entry(models, model_key)?.insert("autoCompactWindow".into(), Value::from(window));
                 }
                 None => {
-                    if let Some(Value::Object(entry)) = models.get_mut(model_key) {
+                    if let Some(entry) = models.get_mut(model_key).and_then(Value::as_object_mut) {
                         entry.remove("autoCompactWindow");
                         if entry.is_empty() {
                             models.remove(model_key);
@@ -343,44 +350,30 @@ impl Settings {
             if models.is_empty() {
                 map.remove("modelSettings");
             }
+            Ok(())
         })
     }
 
     /// Persist whether auto-compaction is enabled in the global settings.
     pub fn save_auto_compaction(enabled: bool) -> Result<()> {
-        Settings::save_global(|map| {
-            let compaction = map.entry("compaction").or_insert_with(|| Value::Object(Default::default()));
-            if let Value::Object(compaction) = compaction {
-                compaction.insert("enabled".into(), Value::Bool(enabled));
-            }
+        update_json_object(&settings_path(), |map| {
+            object_entry(map, "compaction")?.insert("enabled".into(), Value::Bool(enabled));
+            Ok(())
         })
     }
 
     pub fn save_default_model(model_key: &str) -> Result<()> {
-        Settings::save_global(|map| {
+        update_json_object(&settings_path(), |map| {
             map.insert("defaultModel".into(), Value::String(model_key.to_string()));
+            Ok(())
         })
     }
 
     pub fn save_default_thinking_level(level: ThinkingLevel) -> Result<()> {
-        Settings::save_global(|map| {
+        update_json_object(&settings_path(), |map| {
             map.insert("defaultThinkingLevel".into(), Value::String(level.to_string()));
+            Ok(())
         })
-    }
-
-    /// Update keys in the global settings file, preserving everything else in it.
-    pub fn save_global(update: impl FnOnce(&mut serde_json::Map<String, Value>)) -> Result<()> {
-        let path = settings_path();
-        let mut value = read_json_file(&path)?.unwrap_or_else(|| Value::Object(Default::default()));
-        let Value::Object(map) = &mut value else {
-            bail!("{} must contain a JSON object", path.display());
-        };
-        update(map);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, serde_json::to_string_pretty(&value)? + "\n")
-            .with_context(|| format!("failed to write {}", path.display()))
     }
 }
 
@@ -1008,8 +1001,6 @@ impl ModelRegistry {
         }
     }
 
-    /// Short label for display: the model's name, plus its provider when another usable model
-    /// has the same name.
     /// Short label for display: the model's name, plus its provider (or, within one provider,
     /// its alias or id) when another usable model has the same name.
     pub fn label(&self, model: &Model) -> String {

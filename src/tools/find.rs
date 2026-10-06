@@ -2,9 +2,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::grep::{glob_filter, glob_matches, walker};
+use super::listing::{GlobFilter, listing_text, walker};
 use super::path::resolve_path;
-use super::truncate::{DEFAULT_MAX_BYTES, format_size, truncate_head};
+use super::truncate::DEFAULT_MAX_BYTES;
 use super::{Tool, ToolContext, ToolOutput, UpdateFn, parse_args};
 
 pub struct FindTool;
@@ -59,7 +59,7 @@ impl Tool for FindTool {
         if !root.is_dir() {
             anyhow::bail!("Path not found or not a directory: {}", root.display());
         }
-        let matcher = glob_filter(&args.pattern)?;
+        let glob = GlobFilter::new(&args.pattern)?;
         let limit = args.limit.unwrap_or(DEFAULT_LIMIT).max(1);
         let cancel = ctx.cancel.clone();
 
@@ -71,7 +71,7 @@ impl Tool for FindTool {
                 }
                 let Ok(entry) = entry else { continue };
                 let Ok(relative) = entry.path().strip_prefix(&root) else { continue };
-                if relative.as_os_str().is_empty() || !glob_matches(&matcher, relative) {
+                if relative.as_os_str().is_empty() || !glob.matches(relative) {
                     continue;
                 }
                 if results.len() >= limit {
@@ -90,19 +90,12 @@ impl Tool for FindTool {
         if results.is_empty() {
             return Ok(ToolOutput::text("No files found matching pattern"));
         }
-        let truncation = truncate_head(&results.join("\n"), usize::MAX, DEFAULT_MAX_BYTES);
-        let mut text = truncation.content.clone();
-        let mut notes = Vec::new();
-        if limit_reached {
-            notes.push(format!("{limit} results limit reached. Use limit={} for more, or refine pattern", limit * 2));
-        }
-        if truncation.truncated {
-            notes.push(format!("{} limit reached", format_size(DEFAULT_MAX_BYTES)));
-        }
-        if !notes.is_empty() {
-            text.push_str(&format!("\n\n[{}]", notes.join(". ")));
-        }
-        Ok(ToolOutput::text(text).with_details(json!({"count": results.len(), "limitReached": limit_reached})))
+        let notes =
+            Vec::from_iter(limit_reached.then(|| {
+                format!("{limit} results limit reached. Use limit={} for more, or refine pattern", limit * 2)
+            }));
+        Ok(ToolOutput::text(listing_text(&results, notes))
+            .with_details(json!({"count": results.len(), "limitReached": limit_reached})))
     }
 }
 

@@ -12,17 +12,18 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::compaction::{self, CompactionResult};
 use crate::config::{Model, ModelRegistry, Settings, ThinkingLevel};
 use crate::context::{ContextFile, Skill};
 use crate::message::{
-    AssistantMessage, BashExecutionMessage, ContentBlock, Message, StopReason, ToolResultMessage, Usage, UserMessage,
-    now_ms,
+    AssistantMessage, BashExecutionMessage, ContentBlock, Message, StopReason, ToolCallRef, ToolResultMessage, Usage,
+    UserMessage, now_ms,
 };
 use crate::provider::{self, ErrorKind, Request, StreamDelta, ToolSpec};
 use crate::session::{Entry, SessionStore, iso_now, new_entry_id};
@@ -71,12 +72,12 @@ pub enum AgentEvent {
     ToolExecutionUpdate {
         tool_call_id: String,
         tool_name: String,
-        partial_result: ToolResultView,
+        partial_result: ToolOutput,
     },
     ToolExecutionEnd {
         tool_call_id: String,
         tool_name: String,
-        result: ToolResultView,
+        result: ToolOutput,
         is_error: bool,
         duration_ms: u64,
     },
@@ -103,20 +104,6 @@ pub enum AgentEvent {
     },
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ToolResultView {
-    pub content: Vec<ContentBlock>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub details: Option<Value>,
-}
-
-impl From<&ToolOutput> for ToolResultView {
-    fn from(output: &ToolOutput) -> Self {
-        Self { content: output.content.clone(), details: output.details.clone() }
-    }
-}
-
 // ---------------------------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------------------------
@@ -129,7 +116,7 @@ pub enum Busy {
     Bash,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum QueueMode {
     Steer,
@@ -520,10 +507,12 @@ impl Agent {
         }
     }
 
-    pub fn new_session(&self, persist: bool) -> Result<()> {
+    /// Start a new session, saved to disk only if the current one is.
+    pub fn new_session(&self) -> Result<()> {
         {
             let mut state = self.state();
             Self::require_idle(&state)?;
+            let persist = state.session.path().is_some();
             state.session = SessionStore::create(&self.inner.setup.cwd, persist);
             state.messages.clear();
             state.steering.clear();
@@ -564,13 +553,7 @@ impl Agent {
         let mut state = self.state();
         match state.busy {
             None => {
-                let cancel = CancellationToken::new();
-                state.busy = Some(Busy::Running);
-                state.cancel = Some(cancel.clone());
-                drop(state);
-                self.inner.idle.send_replace(false);
-                let agent = self.clone();
-                tokio::spawn(async move { agent.run(vec![Message::User(message)], cancel).await });
+                self.spawn_run(&mut state, vec![Message::User(message)]);
                 Ok(PromptDisposition::Started)
             }
             Some(Busy::Running) => {
@@ -629,12 +612,28 @@ impl Agent {
         let _ = idle.wait_for(|idle| *idle).await;
     }
 
+    /// Mark the agent busy and return the token that cancels the work. The idle signal changes
+    /// while the state lock is held, so it always agrees with `busy`.
+    fn begin(&self, state: &mut State, busy: Busy) -> CancellationToken {
+        let cancel = CancellationToken::new();
+        state.busy = Some(busy);
+        state.cancel = Some(cancel.clone());
+        self.inner.idle.send_replace(false);
+        cancel
+    }
+
     fn finish_busy(&self) {
         let mut state = self.state();
         state.busy = None;
         state.cancel = None;
-        drop(state);
         self.inner.idle.send_replace(true);
+    }
+
+    /// Start a run with `messages` on a background task.
+    fn spawn_run(&self, state: &mut State, messages: Vec<Message>) {
+        let cancel = self.begin(state, Busy::Running);
+        let agent = self.clone();
+        tokio::spawn(async move { agent.run(messages, cancel).await });
     }
 
     /// Start the queued follow-ups if the agent is idle (used after compaction or commands).
@@ -644,14 +643,9 @@ impl Agent {
             return;
         }
         let pending: Vec<Message> = state.follow_up.drain(..).map(Message::User).collect();
-        let cancel = CancellationToken::new();
-        state.busy = Some(Busy::Running);
-        state.cancel = Some(cancel.clone());
+        self.spawn_run(&mut state, pending);
         drop(state);
-        self.inner.idle.send_replace(false);
         self.emit_queue();
-        let agent = self.clone();
-        tokio::spawn(async move { agent.run(pending, cancel).await });
     }
 
     fn append_message(&self, message: Message) {
@@ -684,9 +678,8 @@ impl Agent {
             self.compact_if_needed(&cancel).await;
 
             self.emit(AgentEvent::TurnStart);
-            let assistant = self.stream_response(&cancel).await;
-            let overflow = assistant.stop_reason == StopReason::Error
-                && assistant.error_message.as_deref().is_some_and(provider::is_context_overflow);
+            let (assistant, error) = self.stream_response(&cancel).await;
+            let overflow = error == Some(ErrorKind::ContextOverflow);
             let message = Message::Assistant(assistant.clone());
             self.append_message(message.clone());
             self.emit(AgentEvent::MessageEnd { message: message.clone() });
@@ -739,8 +732,8 @@ impl Agent {
     }
 
     /// Stream one assistant response, retrying transient failures that happen before any
-    /// content arrives. Failures are encoded in the returned message.
-    async fn stream_response(&self, cancel: &CancellationToken) -> AssistantMessage {
+    /// content arrives. Failures are encoded in the returned message, with their kind beside it.
+    async fn stream_response(&self, cancel: &CancellationToken) -> (AssistantMessage, Option<ErrorKind>) {
         let (model, thinking, messages, auto_retry) = {
             let state = self.state();
             (state.model.clone(), state.thinking, state.messages.clone(), state.auto_retry)
@@ -760,7 +753,7 @@ impl Agent {
         self.emit(AgentEvent::MessageStart { message: Message::Assistant(message.clone()) });
         let started = Instant::now();
         let mut attempt = 0;
-        loop {
+        let error = loop {
             message = provider::new_assistant_message(&model, thinking);
             let events = self.inner.events.clone();
             let mut on_delta = |partial: &AssistantMessage, delta: StreamDelta| {
@@ -768,11 +761,11 @@ impl Agent {
             };
             let result = provider::stream(&self.inner.client, &request, &mut message, &mut on_delta, cancel).await;
             match result {
-                Ok(()) => break,
+                Ok(()) => break None,
                 Err(_) if cancel.is_cancelled() => {
                     message.stop_reason = StopReason::Aborted;
                     message.error_message = Some("Request aborted".into());
-                    break;
+                    break None;
                 }
                 Err(err) if err.kind == ErrorKind::Retryable && message.content.is_empty() && attempt < max_retries => {
                     attempt += 1;
@@ -788,7 +781,7 @@ impl Agent {
                         _ = cancel.cancelled() => {
                             message.stop_reason = StopReason::Aborted;
                             message.error_message = Some("Request aborted".into());
-                            break;
+                            break None;
                         }
                         _ = tokio::time::sleep(delay) => {}
                     }
@@ -796,13 +789,13 @@ impl Agent {
                 Err(err) => {
                     message.stop_reason = StopReason::Error;
                     message.error_message = Some(err.message);
-                    break;
+                    break Some(err.kind);
                 }
             }
-        }
+        };
         message.timestamp = now_ms() - started.elapsed().as_millis() as i64;
         message.duration_ms = Some(started.elapsed().as_millis() as u64);
-        message
+        (message, error)
     }
 
     /// Execute the tool calls of `assistant` in order. Consecutive read-only calls run
@@ -811,12 +804,9 @@ impl Agent {
     async fn execute_tools(&self, assistant: &AssistantMessage, cancel: &CancellationToken) -> Vec<Message> {
         let calls: Vec<PendingCall> = assistant
             .tool_calls()
-            .map(|c| PendingCall {
-                id: c.id.to_string(),
-                name: c.name.to_string(),
-                args: c.arguments.clone(),
-                invalid_arguments: c.invalid_arguments.map(str::to_string),
-                tool: self.inner.setup.tools.iter().find(|t| t.name() == c.name).cloned(),
+            .map(|call| PendingCall {
+                tool: self.inner.setup.tools.iter().find(|t| t.name() == call.name).cloned(),
+                call,
             })
             .collect();
         let ctx = Arc::new(ToolContext {
@@ -837,9 +827,9 @@ impl Agent {
             let batch = &calls[start..end];
             for call in batch {
                 self.emit(AgentEvent::ToolExecutionStart {
-                    tool_call_id: call.id.clone(),
-                    tool_name: call.name.clone(),
-                    args: call.args.clone(),
+                    tool_call_id: call.call.id.to_string(),
+                    tool_name: call.call.name.to_string(),
+                    args: call.call.arguments.clone(),
                 });
             }
             let mut running: FuturesUnordered<_> = batch
@@ -859,15 +849,15 @@ impl Agent {
             while let Some((index, output, elapsed)) = running.next().await {
                 let call = &batch[index];
                 self.emit(AgentEvent::ToolExecutionEnd {
-                    tool_call_id: call.id.clone(),
-                    tool_name: call.name.clone(),
-                    result: ToolResultView::from(&output),
+                    tool_call_id: call.call.id.to_string(),
+                    tool_name: call.call.name.to_string(),
+                    result: output.clone(),
                     is_error: output.is_error,
                     duration_ms: elapsed.as_millis() as u64,
                 });
                 batch_results[index] = Some(Message::ToolResult(ToolResultMessage {
-                    tool_call_id: call.id.clone(),
-                    tool_name: call.name.clone(),
+                    tool_call_id: call.call.id.to_string(),
+                    tool_name: call.call.name.to_string(),
                     content: output.content,
                     is_error: output.is_error,
                     details: output.details,
@@ -894,21 +884,22 @@ impl Agent {
         }
     }
 
-    /// Manually compact the conversation (`/compact`).
-    pub async fn compact(&self, instructions: Option<&str>) -> Result<CompactionResult> {
+    /// Manually compact the conversation (`/compact`) on a background task. Fails at once when
+    /// the agent is busy; once started, progress and failures are also reported through
+    /// compaction events.
+    pub fn compact(&self, instructions: Option<String>) -> Result<JoinHandle<Result<CompactionResult>>> {
         let cancel = {
             let mut state = self.state();
             Self::require_idle(&state)?;
-            let cancel = CancellationToken::new();
-            state.busy = Some(Busy::Compacting);
-            state.cancel = Some(cancel.clone());
-            cancel
+            self.begin(&mut state, Busy::Compacting)
         };
-        self.inner.idle.send_replace(false);
-        let result = self.compact_inner(CompactionReason::Manual, instructions, &cancel).await;
-        self.finish_busy();
-        self.start_queued_if_idle();
-        result
+        let agent = self.clone();
+        Ok(tokio::spawn(async move {
+            let result = agent.compact_inner(CompactionReason::Manual, instructions.as_deref(), &cancel).await;
+            agent.finish_busy();
+            agent.start_queued_if_idle();
+            result
+        }))
     }
 
     async fn compact_inner(
@@ -977,12 +968,8 @@ impl Agent {
         let cancel = {
             let mut state = self.state();
             Self::require_idle(&state)?;
-            let cancel = CancellationToken::new();
-            state.busy = Some(Busy::Bash);
-            state.cancel = Some(cancel.clone());
-            cancel
+            self.begin(&mut state, Busy::Bash)
         };
-        self.inner.idle.send_replace(false);
         let result = crate::tools::run_shell_command(
             &self.inner.shell,
             command,
@@ -992,9 +979,7 @@ impl Agent {
             |snapshot| on_update(&snapshot.content),
         )
         .await;
-        self.finish_busy();
-        let result = result?;
-        let message = BashExecutionMessage {
+        let message = result.map(|result| BashExecutionMessage {
             command: command.to_string(),
             output: result.output,
             exit_code: result.exit_code,
@@ -1003,10 +988,14 @@ impl Agent {
             full_output_path: result.full_output_path.map(|p| p.display().to_string()),
             exclude_from_context,
             timestamp: now_ms(),
-        };
-        self.append_message(Message::BashExecution(message.clone()));
+        });
+        // Record the output before going idle so a prompt sent right after it sees the output.
+        if let Ok(message) = &message {
+            self.append_message(Message::BashExecution(message.clone()));
+        }
+        self.finish_busy();
         self.start_queued_if_idle();
-        Ok(message)
+        message
     }
 }
 
@@ -1018,20 +1007,16 @@ pub enum PromptDisposition {
 }
 
 /// A tool call from an assistant message, resolved to its tool.
-struct PendingCall {
-    id: String,
-    name: String,
-    args: Value,
-    /// Raw arguments text when it was not valid JSON.
-    invalid_arguments: Option<String>,
+struct PendingCall<'a> {
+    call: ToolCallRef<'a>,
     tool: Option<Arc<dyn Tool>>,
 }
 
-impl PendingCall {
+impl PendingCall<'_> {
     /// Whether this call may run alongside others. Calls that cannot run (invalid arguments,
     /// unknown tool) have no side effects.
     fn concurrent(&self) -> bool {
-        self.invalid_arguments.is_some() || self.tool.as_ref().is_none_or(|tool| tool.read_only())
+        self.call.invalid_arguments.is_some() || self.tool.as_ref().is_none_or(|tool| tool.read_only())
     }
 
     async fn execute(
@@ -1040,31 +1025,31 @@ impl PendingCall {
         events: mpsc::UnboundedSender<AgentEvent>,
         truncated: bool,
     ) -> ToolOutput {
-        if let Some(raw) = &self.invalid_arguments {
+        if let Some(raw) = self.call.invalid_arguments {
             let note =
                 if truncated { " The response hit the output token limit before the call was complete." } else { "" };
             return ToolOutput::error(format!(
                 "{{\"INVALID_JSON\": {}}}\nThe tool arguments were not valid JSON, so the tool did not run.{note}",
-                Value::String(raw.clone())
+                Value::String(raw.to_string())
             ));
         }
         if ctx.cancel.is_cancelled() {
             return ToolOutput::error("Operation aborted");
         }
         let Some(tool) = &self.tool else {
-            return ToolOutput::error(format!("Tool {} not found", self.name));
+            return ToolOutput::error(format!("Tool {} not found", self.call.name));
         };
         let update: UpdateFn = {
-            let (id, name) = (self.id.clone(), self.name.clone());
+            let (id, name) = (self.call.id.to_string(), self.call.name.to_string());
             Arc::new(move |partial: ToolOutput| {
                 let _ = events.send(AgentEvent::ToolExecutionUpdate {
                     tool_call_id: id.clone(),
                     tool_name: name.clone(),
-                    partial_result: ToolResultView::from(&partial),
+                    partial_result: partial,
                 });
             })
         };
-        match tool.execute(ctx, self.args.clone(), update).await {
+        match tool.execute(ctx, self.call.arguments.clone(), update).await {
             Ok(output) => output,
             Err(err) => ToolOutput::error(format!("{err:#}")),
         }
@@ -1329,6 +1314,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prompts_sent_during_a_command_run_after_it() {
+        let server = MockServer::start(vec![anthropic_text("done")]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, _events) = agent(model(&server.url, Api::AnthropicMessages), dir.path());
+        let command = {
+            let agent = agent.clone();
+            tokio::spawn(async move { agent.run_bash("sleep 0.3", false, |_| {}).await })
+        };
+        while agent.busy() != Some(Busy::Bash) {
+            tokio::task::yield_now().await;
+        }
+        // Compaction is refused at once rather than reported later.
+        assert!(agent.compact(None).is_err());
+        let disposition = agent.prompt(vec![ContentBlock::text("next")], None).unwrap();
+        assert_eq!(disposition, PromptDisposition::Queued(QueueMode::FollowUp));
+        command.await.unwrap().unwrap();
+        agent.wait_idle().await;
+        assert_eq!(roles(&agent.messages()), ["bash", "user", "assistant"]);
+    }
+
+    #[tokio::test]
+    async fn new_sessions_stay_in_memory_when_the_current_one_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, _events) = agent(model("http://127.0.0.1:9", Api::AnthropicMessages), dir.path());
+        assert_eq!(agent.session_path(), None);
+        agent.new_session().unwrap();
+        assert_eq!(agent.session_path(), None);
+    }
+
+    #[tokio::test]
     async fn manual_compaction_summarizes_history() {
         let summary = "## Goal\nTest compaction";
         let server = MockServer::start(vec![
@@ -1343,7 +1358,7 @@ mod tests {
             agent.prompt(vec![ContentBlock::text(text.repeat(100_000))], None).unwrap();
             agent.wait_idle().await;
         }
-        let result = agent.compact(Some("focus on tests")).await.unwrap();
+        let result = agent.compact(Some("focus on tests".into())).unwrap().await.unwrap().unwrap();
         assert!(result.summary.starts_with(summary));
         // The summary replaces the first exchange; the second is kept verbatim.
         assert_eq!(roles(&agent.messages()), ["summary", "user", "assistant"]);

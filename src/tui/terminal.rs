@@ -94,12 +94,11 @@ pub struct Screen {
     drawn: Vec<usize>,
     /// Cursor position within the drawn live region as (line index, column).
     cursor: (usize, usize),
-    width: usize,
 }
 
 impl Screen {
     pub fn new() -> Screen {
-        Screen { drawn: Vec::new(), cursor: (0, 0), width: size().0 }
+        Screen { drawn: Vec::new(), cursor: (0, 0) }
     }
 
     /// Rows the drawn region occupies above the cursor at terminal width `width`, accounting for
@@ -159,7 +158,6 @@ impl Screen {
         stdout.flush()?;
         self.drawn = live.iter().map(|l| visible_width(l)).collect();
         self.cursor = (row, col);
-        self.width = width;
         Ok(())
     }
 
@@ -175,9 +173,5 @@ impl Screen {
         self.drawn.clear();
         self.cursor = (0, 0);
         Ok(())
-    }
-
-    pub fn width(&self) -> usize {
-        self.width
     }
 }

@@ -86,25 +86,26 @@ pub async fn for_each_event(
             _ = cancel.cancelled() => return Err(ProviderError::fatal("aborted")),
             chunk = body.next() => chunk,
         };
-        match chunk {
-            Some(Ok(bytes)) => parser.push(&bytes, &mut events),
+        let done = match chunk {
+            Some(Ok(bytes)) => {
+                parser.push(&bytes, &mut events);
+                false
+            }
             Some(Err(err)) => {
                 return Err(ProviderError::retryable(format!("stream interrupted: {}", super::error_chain(&err))));
             }
             None => {
                 parser.finish(&mut events);
-                for event in events.drain(..) {
-                    if !handle(event)? {
-                        return Ok(());
-                    }
-                }
-                return Ok(());
+                true
             }
-        }
+        };
         for event in events.drain(..) {
             if !handle(event)? {
                 return Ok(());
             }
+        }
+        if done {
+            return Ok(());
         }
     }
 }

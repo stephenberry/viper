@@ -11,15 +11,10 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     DeltaSink, ProviderError, Request, StreamDelta, apply_auth, finish_tool_call, merge_extra_body, normalize_messages,
-    same_model, send, sse,
+    same_model, send, sse, v1_url,
 };
 use crate::config::{Model, Reasoning, ThinkingLevel};
-use crate::message::{AssistantMessage, ContentBlock, Message, StopReason};
-
-pub(super) fn endpoint(base_url: &str) -> String {
-    let base = base_url.trim_end_matches('/');
-    if base.ends_with("/v1") { format!("{base}/chat/completions") } else { format!("{base}/v1/chat/completions") }
-}
+use crate::message::{AssistantMessage, ContentBlock, Message, StopReason, content_text};
 
 fn content_parts(content: &[ContentBlock]) -> Vec<Value> {
     content
@@ -74,6 +69,16 @@ fn assistant_message(message: &AssistantMessage, model: &Model) -> Option<Value>
     Some(out)
 }
 
+/// Tool messages carry only text, so images from tool results follow them as a user message.
+fn flush_tool_images(out: &mut Vec<Value>, images: &mut Vec<Value>) {
+    if images.is_empty() {
+        return;
+    }
+    let mut parts = vec![json!({"type": "text", "text": "Images from the tool results above:"})];
+    parts.append(images);
+    out.push(json!({"role": "user", "content": parts}));
+}
+
 fn convert_messages(request: &Request<'_>) -> Vec<Value> {
     let model = request.model;
     let mut out = Vec::new();
@@ -82,11 +87,8 @@ fn convert_messages(request: &Request<'_>) -> Vec<Value> {
     }
     let mut pending_images: Vec<Value> = Vec::new();
     for message in normalize_messages(request.messages, model) {
-        if !matches!(message, Message::ToolResult(_)) && !pending_images.is_empty() {
-            // Tool messages carry only text; images from tool results follow as a user message.
-            let mut parts = vec![json!({"type": "text", "text": "Images from the tool results above:"})];
-            parts.append(&mut pending_images);
-            out.push(json!({"role": "user", "content": parts}));
+        if !matches!(message, Message::ToolResult(_)) {
+            flush_tool_images(&mut out, &mut pending_images);
         }
         match &message {
             Message::User(user) => {
@@ -97,19 +99,9 @@ fn convert_messages(request: &Request<'_>) -> Vec<Value> {
             }
             Message::Assistant(assistant) => out.extend(assistant_message(assistant, model)),
             Message::ToolResult(result) => {
-                let mut text = String::new();
-                for block in &result.content {
-                    match block {
-                        ContentBlock::Text { text: t } => {
-                            if !text.is_empty() {
-                                text.push('\n');
-                            }
-                            text.push_str(t);
-                        }
-                        ContentBlock::Image { .. } => pending_images.extend(content_parts(std::slice::from_ref(block))),
-                        _ => {}
-                    }
-                }
+                let mut text = content_text(&result.content);
+                pending_images
+                    .extend(content_parts(&result.content).into_iter().filter(|part| part["type"] == "image_url"));
                 if text.is_empty() {
                     text.push_str("(no output)");
                 }
@@ -122,11 +114,7 @@ fn convert_messages(request: &Request<'_>) -> Vec<Value> {
             Message::CompactionSummary(summary) => out.push(text_message("user", summary.to_context_text())),
         }
     }
-    if !pending_images.is_empty() {
-        let mut parts = vec![json!({"type": "text", "text": "Images from the tool results above:"})];
-        parts.append(&mut pending_images);
-        out.push(json!({"role": "user", "content": parts}));
-    }
+    flush_tool_images(&mut out, &mut pending_images);
     out
 }
 
@@ -147,15 +135,7 @@ fn add_cache_breakpoints(messages: &mut [Value]) {
 }
 
 fn reasoning_effort(level: ThinkingLevel) -> Option<&'static str> {
-    match level {
-        ThinkingLevel::Off => None,
-        ThinkingLevel::Minimal => Some("minimal"),
-        ThinkingLevel::Low => Some("low"),
-        ThinkingLevel::Medium => Some("medium"),
-        ThinkingLevel::High => Some("high"),
-        ThinkingLevel::Xhigh => Some("xhigh"),
-        ThinkingLevel::Max => Some("max"),
-    }
+    (level != ThinkingLevel::Off).then(|| level.as_str())
 }
 
 pub(super) fn build_body(request: &Request<'_>) -> Value {
@@ -342,8 +322,10 @@ fn handle_chunk(
                     let id = call.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
                     let name =
                         function.and_then(|f| f.get("name")).and_then(Value::as_str).unwrap_or_default().to_string();
+                    // Some servers omit the id; the agent needs one to pair the call with its result.
+                    let id = if id.is_empty() { format!("call_{}", uuid::Uuid::new_v4().simple()) } else { id };
                     out.content.push(ContentBlock::ToolCall {
-                        id: if id.is_empty() { format!("call_{}", uuid::Uuid::new_v4().simple()) } else { id.clone() },
+                        id: id.clone(),
                         name: name.clone(),
                         arguments: Value::Object(Default::default()),
                         invalid_arguments: None,
@@ -394,7 +376,10 @@ pub(super) async fn stream(
     cancel: &CancellationToken,
 ) -> Result<(), ProviderError> {
     let body = build_body(request);
-    let builder = client.post(endpoint(&request.model.base_url)).header("accept", "text/event-stream").json(&body);
+    let builder = client
+        .post(v1_url(&request.model.base_url, "chat/completions"))
+        .header("accept", "text/event-stream")
+        .json(&body);
     let response = send(apply_auth(builder, request.model, api_key)?, cancel).await?;
 
     let mut state = StreamState::default();
@@ -521,5 +506,23 @@ mod tests {
         );
         assert_eq!(out.usage.input, 40);
         assert_eq!(out.usage.cache_read, 60);
+    }
+
+    #[test]
+    fn tool_calls_without_ids_get_one_in_the_message_and_the_event() {
+        let model = gateway_model();
+        let mut out = super::super::new_assistant_message(&model, ThinkingLevel::High);
+        let mut state = StreamState::default();
+        let mut started = Vec::new();
+        let mut sink = |_: &AssistantMessage, delta: StreamDelta| {
+            if let StreamDelta::ToolcallStart { id, .. } = delta {
+                started.push(id);
+            }
+        };
+        let chunk = json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"name": "ls", "arguments": "{}"}}]}}]});
+        handle_chunk(&chunk, &mut out, &mut state, &mut sink).unwrap();
+        let ContentBlock::ToolCall { id, .. } = &out.content[0] else { panic!("expected a tool call") };
+        assert!(id.starts_with("call_"));
+        assert_eq!(started, std::slice::from_ref(id));
     }
 }

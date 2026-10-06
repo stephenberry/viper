@@ -130,8 +130,15 @@ fn extract_error_message(body: &str) -> String {
     if trimmed.is_empty() { "(empty response body)".to_string() } else { trimmed.chars().take(2000).collect() }
 }
 
+/// `path` under the API's `/v1` prefix, which `base_url` may already end with.
+fn v1_url(base_url: &str, path: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    let base = base.strip_suffix("/v1").unwrap_or(base);
+    format!("{base}/v1/{path}")
+}
+
 /// Recognize context-window overflow errors across Anthropic, OpenAI, and LiteLLM.
-pub fn is_context_overflow(message: &str) -> bool {
+fn is_context_overflow(message: &str) -> bool {
     let lower = message.to_lowercase();
     [
         "prompt is too long",
@@ -231,9 +238,7 @@ pub enum CredentialCheck {
 /// Check `api_key` against the model's server by listing its models (`GET /v1/models`, which
 /// Anthropic, OpenAI-compatible servers, and LiteLLM provide).
 pub async fn check_credentials(client: &reqwest::Client, model: &Model, api_key: &str) -> CredentialCheck {
-    let base = model.base_url.trim_end_matches('/');
-    let base = base.strip_suffix("/v1").unwrap_or(base);
-    let builder = client.get(format!("{base}/v1/models")).timeout(Duration::from_secs(20));
+    let builder = client.get(v1_url(&model.base_url, "models")).timeout(Duration::from_secs(20));
     let builder = match apply_auth(builder, model, api_key) {
         Ok(builder) => builder,
         Err(err) => return CredentialCheck::Unverified(err.message),
@@ -401,6 +406,12 @@ fn same_model(message: &AssistantMessage, model: &Model) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v1_urls_accept_bases_with_or_without_v1() {
+        assert_eq!(v1_url("https://api.anthropic.com", "messages"), "https://api.anthropic.com/v1/messages");
+        assert_eq!(v1_url("http://localhost:4000/v1/", "models"), "http://localhost:4000/v1/models");
+    }
 
     #[test]
     fn overflow_detection() {

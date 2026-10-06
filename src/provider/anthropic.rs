@@ -6,18 +6,13 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     DeltaSink, ProviderError, Request, StreamDelta, apply_auth, finish_tool_call, merge_extra_body, normalize_messages,
-    same_model, send, sse,
+    same_model, send, sse, v1_url,
 };
 use crate::config::{Model, Reasoning, ThinkingLevel};
 use crate::message::{AssistantMessage, ContentBlock, Message, StopReason};
 
 pub(super) const API_VERSION: &str = "2023-06-01";
 const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
-
-pub(super) fn endpoint(base_url: &str) -> String {
-    let base = base_url.trim_end_matches('/');
-    if base.ends_with("/v1") { format!("{base}/messages") } else { format!("{base}/v1/messages") }
-}
 
 fn effort(level: ThinkingLevel) -> &'static str {
     match level {
@@ -400,7 +395,8 @@ pub(super) async fn stream(
     cancel: &CancellationToken,
 ) -> Result<(), ProviderError> {
     let (body, betas) = build_body(request);
-    let mut builder = client.post(endpoint(&request.model.base_url)).header("accept", "text/event-stream").json(&body);
+    let mut builder =
+        client.post(v1_url(&request.model.base_url, "messages")).header("accept", "text/event-stream").json(&body);
     if !betas.is_empty() {
         builder = builder.header("anthropic-beta", betas.join(","));
     }
@@ -444,12 +440,6 @@ mod tests {
         message.content = content;
         message.stop_reason = stop;
         message
-    }
-
-    #[test]
-    fn endpoint_handles_v1_suffix() {
-        assert_eq!(endpoint("https://api.anthropic.com"), "https://api.anthropic.com/v1/messages");
-        assert_eq!(endpoint("http://localhost:4000/v1/"), "http://localhost:4000/v1/messages");
     }
 
     #[test]

@@ -2,8 +2,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::listing::listing_text;
 use super::path::resolve_path;
-use super::truncate::{DEFAULT_MAX_BYTES, format_size, truncate_head};
+use super::truncate::DEFAULT_MAX_BYTES;
 use super::{Tool, ToolContext, ToolOutput, UpdateFn, parse_args};
 
 pub struct LsTool;
@@ -75,19 +76,10 @@ impl Tool for LsTool {
         let total = entries.len();
         let limit_reached = total > limit;
         entries.truncate(limit);
-        let truncation = truncate_head(&entries.join("\n"), usize::MAX, DEFAULT_MAX_BYTES);
-        let mut text = truncation.content.clone();
-        let mut notes = Vec::new();
-        if limit_reached {
-            notes.push(format!("{limit} of {total} entries shown. Use limit={} for more", limit * 2));
-        }
-        if truncation.truncated {
-            notes.push(format!("{} limit reached", format_size(DEFAULT_MAX_BYTES)));
-        }
-        if !notes.is_empty() {
-            text.push_str(&format!("\n\n[{}]", notes.join(". ")));
-        }
-        Ok(ToolOutput::text(text))
+        let notes = Vec::from_iter(
+            limit_reached.then(|| format!("{limit} of {total} entries shown. Use limit={} for more", limit * 2)),
+        );
+        Ok(ToolOutput::text(listing_text(&entries, notes)))
     }
 }
 

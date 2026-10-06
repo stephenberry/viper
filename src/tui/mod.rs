@@ -23,7 +23,7 @@ use futures::StreamExt;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use crate::agent::{Agent, AgentEvent, Busy, CompactionReason, PromptDisposition, QueueMode};
+use crate::agent::{Agent, AgentEvent, Busy, CompactionReason, QueueMode};
 use crate::auth::{AuthStore, auth_path};
 use crate::config::{Model, ModelRegistry, Settings, ThinkingLevel, has_credentials, parse_auto_compact_window};
 use crate::message::{BashExecutionMessage, ContentBlock, Message, StopReason};
@@ -76,7 +76,6 @@ const HOTKEYS: &[(&str, &str)] = &[
 enum AppMsg {
     BashUpdate(String),
     BashDone(Result<BashExecutionMessage>),
-    CompactDone(Result<()>),
     LoginChecked(Box<CheckedLogin>),
 }
 
@@ -155,7 +154,8 @@ struct App {
     hide_thinking: bool,
     expanded: bool,
     tool_lines: usize,
-    footer: String,
+    /// Footer text: the location on the left, the session's numbers on the right.
+    footer: (String, String),
     git_branch: Option<String>,
     last_ctrl_c: Option<Instant>,
     app_tx: mpsc::UnboundedSender<AppMsg>,
@@ -268,7 +268,7 @@ impl App {
             notice: None,
             spinner: 0,
             expanded: false,
-            footer: String::new(),
+            footer: Default::default(),
             last_ctrl_c: None,
             app_tx,
             quit: false,
@@ -355,11 +355,11 @@ impl App {
         if !model.thinking_levels.is_empty() {
             right.push_str(&format!(" · {thinking}"));
         }
-        self.footer = format!("{left}\u{0}{right}");
+        self.footer = (left, right);
     }
 
     fn footer_line(&self, width: usize) -> String {
-        let (left, right) = self.footer.split_once('\u{0}').unwrap_or((&self.footer, ""));
+        let (left, right) = &self.footer;
         let right_width = visible_width(right);
         if right_width + 4 >= width {
             return dim(&truncate(right, width));
@@ -407,7 +407,7 @@ impl App {
                     push_wrapped(&mut lines, Line::plain(block.markdown.preview_line(&sanitize(&block.partial))));
                 }
                 StreamKind::Thinking if self.hide_thinking && block.had_content => {
-                    lines.push(format!("{GRAY}{ITALIC}∴ Thinking…{RESET}"));
+                    lines.push(render::hidden_thinking());
                 }
                 StreamKind::Thinking if !block.partial.is_empty() => {
                     push_wrapped(
@@ -432,24 +432,14 @@ impl App {
             let elapsed = tool.started.elapsed().as_secs();
             let suffix = if elapsed >= 2 { format!(" {GRAY}{elapsed}s{RESET}") } else { String::new() };
             lines.push(truncate(&format!("{}{suffix}", header.text), width));
-            if !tool.output.is_empty() {
-                let tail: Vec<&str> = tool.output.lines().rev().take(5).collect();
-                for (i, line) in tail.iter().rev().enumerate() {
-                    let prefix = if i == 0 { render::BODY_FIRST } else { render::BODY_REST };
-                    lines.push(truncate(&format!("{prefix}{}", dim(&sanitize(line))), width));
-                }
-            }
+            push_output_tail(&mut lines, &tool.output, width);
         }
         if let Some((command, output)) = &self.bash_live {
             lines.push(truncate(
                 &format!("{YELLOW}{}{RESET} {BOLD}{}{RESET}", self.spinner_frame(), sanitize(command)),
                 width,
             ));
-            let tail: Vec<&str> = output.lines().rev().take(5).collect();
-            for (i, line) in tail.iter().rev().enumerate() {
-                let prefix = if i == 0 { render::BODY_FIRST } else { render::BODY_REST };
-                lines.push(truncate(&format!("{prefix}{}", dim(&sanitize(line))), width));
-            }
+            push_output_tail(&mut lines, output, width);
         }
 
         let busy = self.agent.busy();
@@ -511,7 +501,7 @@ impl App {
         let (cursor_row, cursor_col) = self.editor.cursor_position(content_width);
         let editor_top = lines.len();
         for (i, row) in rows.iter().enumerate() {
-            let prefix = if i == 0 { format!("{CYAN}›{RESET} ") } else { "  ".to_string() };
+            let prefix = if i == 0 { render::PROMPT_PREFIX } else { "  " };
             lines.push(format!("{prefix}{row}"));
         }
         if self.editor.is_empty() {
@@ -520,7 +510,8 @@ impl App {
             } else {
                 "ask anything · / for commands · ! to run a shell command"
             };
-            lines[editor_top] = format!("{CYAN}›{RESET} {GRAY}{}{RESET}", truncate(placeholder, content_width));
+            lines[editor_top] =
+                format!("{}{GRAY}{}{RESET}", render::PROMPT_PREFIX, truncate(placeholder, content_width));
         }
         lines.push(border);
         let suggestions = self.suggestions();
@@ -556,6 +547,13 @@ impl App {
 
     // --- Agent events -------------------------------------------------------------------------
 
+    fn flush_blocks(&mut self) {
+        let indices: Vec<usize> = self.blocks.keys().copied().collect();
+        for index in indices {
+            self.flush_block(index);
+        }
+    }
+
     fn flush_block(&mut self, index: usize) {
         let Some(mut block) = self.blocks.remove(&index) else { return };
         if !block.partial.is_empty() {
@@ -564,7 +562,7 @@ impl App {
         }
         if matches!(block.kind, StreamKind::Thinking) && self.hide_thinking && block.had_content {
             self.gap();
-            self.commit(vec![Line::plain(format!("{GRAY}{ITALIC}∴ Thinking…{RESET}"))]);
+            self.commit(vec![Line::plain(render::hidden_thinking())]);
         }
     }
 
@@ -637,10 +635,7 @@ impl App {
                 self.busy_since = None;
                 self.status = None;
                 self.streaming_tool = None;
-                let indices: Vec<usize> = self.blocks.keys().copied().collect();
-                for index in indices {
-                    self.flush_block(index);
-                }
+                self.flush_blocks();
                 self.git_branch = git_branch(self.agent.cwd());
                 self.refresh_footer();
             }
@@ -657,10 +652,7 @@ impl App {
                 self.on_delta(assistant_message_event);
             }
             AgentEvent::MessageEnd { message: Message::Assistant(assistant) } => {
-                let indices: Vec<usize> = self.blocks.keys().copied().collect();
-                for index in indices {
-                    self.flush_block(index);
-                }
+                self.flush_blocks();
                 self.streaming_tool = None;
                 match assistant.stop_reason {
                     StopReason::Error => self.error(assistant.error_message.as_deref().unwrap_or("request failed")),
@@ -689,15 +681,15 @@ impl App {
                     tool.output = crate::message::content_text(&partial_result.content);
                 }
             }
-            AgentEvent::ToolExecutionEnd { tool_call_id, tool_name, result, is_error, .. } => {
+            AgentEvent::ToolExecutionEnd { tool_call_id, tool_name, result, .. } => {
                 let args = match self.running_tools.iter().position(|t| t.id == tool_call_id) {
                     Some(index) => self.running_tools.remove(index).args,
                     None => Value::Null,
                 };
-                let state = if is_error { ToolState::Failed } else { ToolState::Done };
+                let state = if result.is_error { ToolState::Failed } else { ToolState::Done };
                 self.gap();
                 let mut lines = vec![render::tool_header(&tool_name, &args, state, "")];
-                lines.extend(render::tool_body(&tool_name, &args, &result, is_error, self.tool_max_lines()));
+                lines.extend(render::tool_body(&tool_name, &args, &result, self.tool_max_lines()));
                 self.commit(lines);
             }
             AgentEvent::CompactionStart { reason } => {
@@ -746,16 +738,6 @@ impl App {
                 self.refresh_footer();
             }
             AppMsg::LoginChecked(login) => self.finish_login(*login),
-            AppMsg::CompactDone(result) => {
-                // Success and failure are reported through compaction events; only report
-                // errors that happened before compaction started.
-                if let Err(err) = result
-                    && self.status.is_none()
-                {
-                    self.error(&format!("{err:#}"));
-                }
-                self.refresh_footer();
-            }
         }
     }
 
@@ -765,14 +747,14 @@ impl App {
         self.width().saturating_sub(2).max(4)
     }
 
-    async fn on_terminal(&mut self, event: Event) -> Result<()> {
+    fn on_terminal(&mut self, event: Event) -> Result<()> {
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 let result = if self.overlay.is_some() {
                     self.on_overlay_key(key)
                 } else {
                     self.notice = None;
-                    self.on_key(key).await
+                    self.on_key(key)
                 };
                 // A failed action (switching models, saving settings, ...) is reported and the
                 // session continues; terminal failures surface from drawing instead.
@@ -802,7 +784,7 @@ impl App {
         Ok(())
     }
 
-    async fn on_key(&mut self, key: KeyEvent) -> Result<()> {
+    fn on_key(&mut self, key: KeyEvent) -> Result<()> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -814,7 +796,7 @@ impl App {
             KeyCode::Enter if shift => self.editor.insert_newline(),
             KeyCode::Enter if alt => {
                 if self.agent.busy() == Some(Busy::Running) {
-                    self.submit(Some(QueueMode::FollowUp)).await?;
+                    self.submit(Some(QueueMode::FollowUp))?;
                 } else {
                     self.editor.insert_newline();
                 }
@@ -835,10 +817,10 @@ impl App {
                     if takes_args {
                         self.editor.insert(" ");
                     } else {
-                        self.submit(Some(QueueMode::Steer)).await?;
+                        self.submit(Some(QueueMode::Steer))?;
                     }
                 } else {
-                    self.submit(Some(QueueMode::Steer)).await?;
+                    self.submit(Some(QueueMode::Steer))?;
                 }
             }
             KeyCode::Tab => self.complete(&suggestions),
@@ -1040,7 +1022,7 @@ impl App {
         Ok(())
     }
 
-    async fn submit(&mut self, queue: Option<QueueMode>) -> Result<()> {
+    fn submit(&mut self, queue: Option<QueueMode>) -> Result<()> {
         let text = self.editor.text().trim_end().to_string();
         if text.trim().is_empty() && self.attachments.is_empty() {
             return Ok(());
@@ -1053,7 +1035,7 @@ impl App {
             let name = rest.split_whitespace().next().unwrap_or("");
             if COMMANDS.iter().any(|(n, _, _)| *n == name) {
                 let args = rest[name.len()..].trim().to_string();
-                return self.command(name, &args).await;
+                return self.command(name, &args);
             }
         }
         if let Some(command) = text.strip_prefix('!') {
@@ -1084,24 +1066,14 @@ impl App {
         }
 
         let content = crate::agent::user_content(&text, std::mem::take(&mut self.attachments));
-        let content = match crate::modes::expand_skill(&self.agent, content) {
-            Ok(content) => content,
-            Err(err) => {
-                self.error(&format!("{err:#}"));
-                return Ok(());
-            }
-        };
-        match self.agent.prompt(content, queue) {
-            Ok(PromptDisposition::Started) => {}
-            Ok(PromptDisposition::Queued(_)) => {}
-            Err(err) => self.error(&format!("{err:#}")),
-        }
+        let content = crate::modes::expand_skill(&self.agent, content)?;
+        self.agent.prompt(content, queue)?;
         Ok(())
     }
 
     // --- Commands -----------------------------------------------------------------------------
 
-    async fn command(&mut self, name: &str, args: &str) -> Result<()> {
+    fn command(&mut self, name: &str, args: &str) -> Result<()> {
         match name {
             "help" => {
                 let mut lines = vec![Line::plain(bold("Commands"))];
@@ -1128,40 +1100,26 @@ impl App {
             }
             "quit" => self.quit = true,
             "model" if args.is_empty() => self.open_model_selector(),
-            "model" => match self.agent.registry().find(args) {
-                Ok(model) => self.apply_model(model)?,
-                Err(err) => self.error(&format!("{err:#}")),
-            },
+            "model" => self.apply_model(self.agent.registry().find(args)?)?,
             "thinking" if args.is_empty() => self.open_thinking_selector(),
-            "thinking" => match args.parse::<ThinkingLevel>() {
-                Ok(level) => self.apply_thinking(level)?,
-                Err(err) => self.error(&format!("{err:#}")),
-            },
-            "new" => match self.agent.new_session(self.agent.session_path().is_some()) {
-                Ok(()) => {
-                    self.notice("New session started.");
-                    self.refresh_footer();
-                }
-                Err(err) => self.error(&format!("{err:#}")),
-            },
+            "thinking" => self.apply_thinking(args.parse()?)?,
+            "new" => {
+                self.agent.new_session()?;
+                self.notice("New session started.");
+                self.refresh_footer();
+            }
             "resume" => self.open_session_selector(),
             "session" => self.show_session(),
-            "name" => match self.agent.set_session_name(args) {
-                Ok(()) => {
-                    self.notice(&format!("Session named \"{args}\"."));
-                    self.refresh_footer();
-                }
-                Err(err) => self.error(&format!("{err:#}")),
-            },
-            "compact" => {
-                let (agent, tx, args) = (self.agent.clone(), self.app_tx.clone(), args.to_string());
-                tokio::spawn(async move {
-                    let instructions = (!args.is_empty()).then_some(args);
-                    let result = agent.compact(instructions.as_deref()).await.map(|_| ());
-                    let _ = tx.send(AppMsg::CompactDone(result));
-                });
+            "name" => {
+                self.agent.set_session_name(args)?;
+                self.notice(&format!("Session named \"{args}\"."));
+                self.refresh_footer();
             }
-            "autocompact" => self.autocompact(args),
+            "compact" => {
+                // Progress and the result arrive as compaction events.
+                self.agent.compact((!args.is_empty()).then(|| args.to_string()))?;
+            }
+            "autocompact" => self.autocompact(args)?,
             "login" => self.start_login(args),
             "copy" => match self.agent.last_assistant_text() {
                 Some(text) => match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
@@ -1177,7 +1135,7 @@ impl App {
 
     /// `/autocompact [<size>|auto|off|on]`: change when auto-compaction runs for the current
     /// model, saving the choice to the global settings like Claude Code does.
-    fn autocompact(&mut self, args: &str) {
+    fn autocompact(&mut self, args: &str) -> Result<()> {
         let model = self.agent.model();
         let key = model.key();
         let label = self.agent.registry().label(&model);
@@ -1193,20 +1151,15 @@ impl App {
                 self.agent.set_auto_compact_window(None);
                 Settings::save_auto_compact_window(&key, None)
             }
-            size => match parse_auto_compact_window(size) {
-                Ok(window) => {
-                    self.agent.set_auto_compact_window(Some(window));
-                    let enable = (!self.agent.snapshot().auto_compaction_enabled).then(|| {
-                        self.agent.set_auto_compaction(true);
-                        Settings::save_auto_compaction(true)
-                    });
-                    Settings::save_auto_compact_window(&key, Some(window)).and(enable.unwrap_or(Ok(())))
-                }
-                Err(err) => {
-                    self.error(&format!("{err:#}"));
-                    return;
-                }
-            },
+            size => {
+                let window = parse_auto_compact_window(size)?;
+                self.agent.set_auto_compact_window(Some(window));
+                let enable = (!self.agent.snapshot().auto_compaction_enabled).then(|| {
+                    self.agent.set_auto_compaction(true);
+                    Settings::save_auto_compaction(true)
+                });
+                Settings::save_auto_compact_window(&key, Some(window)).and(enable.unwrap_or(Ok(())))
+            }
         };
 
         let snapshot = self.agent.snapshot();
@@ -1235,6 +1188,7 @@ impl App {
             self.error(&format!("The change applies to this session but could not be saved: {err:#}"));
         }
         self.refresh_footer();
+        Ok(())
     }
 
     /// `/login <provider>`: ask for the base URL and API key, check the key, and save it.
@@ -1453,15 +1407,8 @@ impl App {
             })
             .collect();
         let initial = models.iter().position(|m| m.key() == current).unwrap_or(0);
-        self.overlay = Some(Overlay::Model(
-            Selector::new(
-                "Model",
-                items,
-                initial,
-                "↑↓ select · enter use · esc cancel",
-            ),
-            models,
-        ));
+        self.overlay =
+            Some(Overlay::Model(Selector::new("Model", items, initial, "↑↓ select · enter use · esc cancel"), models));
     }
 
     fn open_thinking_selector(&mut self) {
@@ -1473,10 +1420,8 @@ impl App {
         let levels = model.thinking_levels.clone();
         let items = levels.iter().map(|l| Item { label: l.to_string(), ..Default::default() }).collect();
         let initial = levels.iter().position(|l| *l == self.agent.thinking()).unwrap_or(0);
-        self.overlay = Some(Overlay::Thinking(
-            Selector::new("Thinking level", items, initial, "enter use · esc cancel"),
-            levels,
-        ));
+        self.overlay =
+            Some(Overlay::Thinking(Selector::new("Thinking level", items, initial, "enter use · esc cancel"), levels));
     }
 
     fn open_session_selector(&mut self) {
@@ -1512,22 +1457,17 @@ impl App {
             Overlay::Login(_) => unreachable!("login keys are handled above"),
             Overlay::Model(_, mut models) => self.apply_model(models.swap_remove(index))?,
             Overlay::Thinking(_, levels) => self.apply_thinking(levels[index])?,
-            Overlay::Session(_, paths) => match self.agent.switch_session(&paths[index]) {
-                Ok(warnings) => {
-                    self.notice(&format!("Resumed {}", paths[index].display()));
-                    for warning in warnings {
-                        self.error(&warning);
-                    }
-                    let lines = render::transcript_lines(
-                        &self.agent.session_messages(),
-                        self.hide_thinking,
-                        self.tool_max_lines(),
-                    );
-                    self.commit(lines);
-                    self.refresh_footer();
+            Overlay::Session(_, paths) => {
+                let warnings = self.agent.switch_session(&paths[index])?;
+                self.notice(&format!("Resumed {}", paths[index].display()));
+                for warning in warnings {
+                    self.error(&warning);
                 }
-                Err(err) => self.error(&format!("{err:#}")),
-            },
+                let lines =
+                    render::transcript_lines(&self.agent.session_messages(), self.hide_thinking, self.tool_max_lines());
+                self.commit(lines);
+                self.refresh_footer();
+            }
         }
         Ok(())
     }
@@ -1556,6 +1496,15 @@ impl App {
         }
         lines.push(Line::plain(dim("esc interrupt · shift+tab thinking · ctrl+l model")));
         self.commit(lines);
+    }
+}
+
+/// The last lines of a running command's output, under its header.
+fn push_output_tail(lines: &mut Vec<String>, output: &str, width: usize) {
+    let tail: Vec<&str> = output.lines().rev().take(5).collect();
+    for (i, line) in tail.iter().rev().enumerate() {
+        let prefix = if i == 0 { render::BODY_FIRST } else { render::BODY_REST };
+        lines.push(truncate(&format!("{prefix}{}", dim(&sanitize(line))), width));
     }
 }
 
@@ -1615,7 +1564,7 @@ pub async fn run(
         tokio::select! {
             event = terminal_events.next() => match event {
                 Some(Ok(event)) => {
-                    app.on_terminal(event).await?;
+                    app.on_terminal(event)?;
                     dirty = true;
                 }
                 Some(Err(err)) => return Err(err).context("terminal input failed"),
@@ -1668,7 +1617,7 @@ pub async fn pick_session(cwd: &Path) -> Result<Option<PathBuf>> {
     let mut selector = Selector::new("Resume session", items, 0, "↑↓ select · enter resume · esc cancel");
     let mut events = EventStream::new();
     let choice = loop {
-        screen.draw(&[], &selector.render(screen.width().max(terminal::size().0)), None)?;
+        screen.draw(&[], &selector.render(terminal::size().0), None)?;
         match events.next().await {
             Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => match selector.handle_key(key) {
                 SelectAction::None => {}
