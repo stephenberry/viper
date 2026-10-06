@@ -845,6 +845,7 @@ impl App {
             KeyCode::BackTab => match self.agent.cycle_thinking()? {
                 Some(level) => {
                     self.notice = Some(format!("Thinking level: {level}"));
+                    self.save_default_thinking(level);
                     self.refresh_footer();
                 }
                 None => self.notice = Some("This model has no thinking levels.".into()),
@@ -1128,16 +1129,12 @@ impl App {
             "quit" => self.quit = true,
             "model" if args.is_empty() => self.open_model_selector(),
             "model" => match self.agent.registry().find(args) {
-                Ok(model) => self.apply_model(model, false)?,
+                Ok(model) => self.apply_model(model)?,
                 Err(err) => self.error(&format!("{err:#}")),
             },
             "thinking" if args.is_empty() => self.open_thinking_selector(),
             "thinking" => match args.parse::<ThinkingLevel>() {
-                Ok(level) => {
-                    let applied = self.agent.set_thinking(level)?;
-                    self.notice(&format!("Thinking level: {applied}"));
-                    self.refresh_footer();
-                }
+                Ok(level) => self.apply_thinking(level)?,
                 Err(err) => self.error(&format!("{err:#}")),
             },
             "new" => match self.agent.new_session(self.agent.session_path().is_some()) {
@@ -1404,18 +1401,33 @@ impl App {
         self.commit(lines);
     }
 
-    fn apply_model(&mut self, model: crate::config::Model, save: bool) -> Result<()> {
+    /// Switch to a model the user chose and make it the default for new sessions.
+    fn apply_model(&mut self, model: crate::config::Model) -> Result<()> {
         let key = model.key();
         let label = self.agent.registry().label(&model);
         self.agent.set_model(model)?;
-        if save {
-            Settings::save_global(|map| {
-                map.insert("defaultModel".into(), Value::String(key.clone()));
-            })?;
+        self.notice(&format!("Model: {label}"));
+        if let Err(err) = Settings::save_default_model(&key) {
+            self.error(&format!("Could not save the default model: {err:#}"));
         }
-        self.notice(&format!("Model: {label}{}", if save { " (saved as default)" } else { "" }));
         self.refresh_footer();
         Ok(())
+    }
+
+    /// Set a thinking level the user chose and make it the default for new sessions. The
+    /// requested level is saved, so a model supporting more than the current one gets it.
+    fn apply_thinking(&mut self, level: ThinkingLevel) -> Result<()> {
+        let applied = self.agent.set_thinking(level)?;
+        self.notice(&format!("Thinking level: {applied}"));
+        self.save_default_thinking(level);
+        self.refresh_footer();
+        Ok(())
+    }
+
+    fn save_default_thinking(&mut self, level: ThinkingLevel) {
+        if let Err(err) = Settings::save_default_thinking_level(level) {
+            self.error(&format!("Could not save the default thinking level: {err:#}"));
+        }
     }
 
     fn open_model_selector(&mut self) {
@@ -1446,7 +1458,7 @@ impl App {
                 "Model",
                 items,
                 initial,
-                "↑↓ select · enter use · ctrl+s use and save as default · esc cancel",
+                "↑↓ select · enter use · esc cancel",
             ),
             models,
         ));
@@ -1462,7 +1474,7 @@ impl App {
         let items = levels.iter().map(|l| Item { label: l.to_string(), ..Default::default() }).collect();
         let initial = levels.iter().position(|l| *l == self.agent.thinking()).unwrap_or(0);
         self.overlay = Some(Overlay::Thinking(
-            Selector::new("Thinking level", items, initial, "enter use · ctrl+s use and save as default · esc cancel"),
+            Selector::new("Thinking level", items, initial, "enter use · esc cancel"),
             levels,
         ));
     }
@@ -1488,27 +1500,18 @@ impl App {
                 return Ok(());
             }
         };
-        let (index, save) = match selector.handle_key(key) {
+        let index = match selector.handle_key(key) {
             SelectAction::None => return Ok(()),
             SelectAction::Cancel => {
                 self.overlay = None;
                 return Ok(());
             }
-            SelectAction::Choose { index, save } => (index, save),
+            SelectAction::Choose(index) => index,
         };
         match self.overlay.take().expect("overlay checked above") {
             Overlay::Login(_) => unreachable!("login keys are handled above"),
-            Overlay::Model(_, mut models) => self.apply_model(models.swap_remove(index), save)?,
-            Overlay::Thinking(_, levels) => {
-                let applied = self.agent.set_thinking(levels[index])?;
-                if save {
-                    Settings::save_global(|map| {
-                        map.insert("defaultThinkingLevel".into(), Value::String(applied.to_string()));
-                    })?;
-                }
-                self.notice(&format!("Thinking level: {applied}{}", if save { " (saved as default)" } else { "" }));
-                self.refresh_footer();
-            }
+            Overlay::Model(_, mut models) => self.apply_model(models.swap_remove(index))?,
+            Overlay::Thinking(_, levels) => self.apply_thinking(levels[index])?,
             Overlay::Session(_, paths) => match self.agent.switch_session(&paths[index]) {
                 Ok(warnings) => {
                     self.notice(&format!("Resumed {}", paths[index].display()));
@@ -1670,7 +1673,7 @@ pub async fn pick_session(cwd: &Path) -> Result<Option<PathBuf>> {
             Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => match selector.handle_key(key) {
                 SelectAction::None => {}
                 SelectAction::Cancel => break None,
-                SelectAction::Choose { index, .. } => break Some(sessions[index].path.clone()),
+                SelectAction::Choose(index) => break Some(sessions[index].path.clone()),
             },
             Some(Ok(_)) => {}
             Some(Err(err)) => return Err(err.into()),

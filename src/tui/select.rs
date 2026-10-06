@@ -16,11 +16,8 @@ pub struct Item {
 pub enum SelectAction {
     None,
     Cancel,
-    /// Chosen item index; `save` is set when chosen with Ctrl+S.
-    Choose {
-        index: usize,
-        save: bool,
-    },
+    /// Index of the chosen item.
+    Choose(usize),
 }
 
 pub struct Selector {
@@ -82,12 +79,7 @@ impl Selector {
             KeyCode::Char('c') if ctrl => return SelectAction::Cancel,
             KeyCode::Enter => {
                 if let Some(index) = self.visible.get(self.selected) {
-                    return SelectAction::Choose { index: *index, save: false };
-                }
-            }
-            KeyCode::Char('s') if ctrl => {
-                if let Some(index) = self.visible.get(self.selected) {
-                    return SelectAction::Choose { index: *index, save: true };
+                    return SelectAction::Choose(*index);
                 }
             }
             KeyCode::Up => self.selected = self.selected.checked_sub(1).unwrap_or(self.visible.len().saturating_sub(1)),

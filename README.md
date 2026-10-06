@@ -130,7 +130,7 @@ Model fields: `id`, `alias`, `name`, `base`, `api`, `contextWindow`, `maxTokens`
 }
 ```
 
-In the model and thinking pickers, **Ctrl+S** saves the choice as the default.
+Choosing a model or thinking level in the interactive UI (`/model`, `/thinking`, **Ctrl+L**, **Shift+Tab**) also saves it as `defaultModel` or `defaultThinkingLevel`. Resuming a session and RPC commands do not change the defaults.
 
 `modelSettings` holds per-model settings keyed by `provider/model-id`; `/autocompact` writes `autoCompactWindow` there.
 

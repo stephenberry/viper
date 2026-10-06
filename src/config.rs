@@ -356,6 +356,18 @@ impl Settings {
         })
     }
 
+    pub fn save_default_model(model_key: &str) -> Result<()> {
+        Settings::save_global(|map| {
+            map.insert("defaultModel".into(), Value::String(model_key.to_string()));
+        })
+    }
+
+    pub fn save_default_thinking_level(level: ThinkingLevel) -> Result<()> {
+        Settings::save_global(|map| {
+            map.insert("defaultThinkingLevel".into(), Value::String(level.to_string()));
+        })
+    }
+
     /// Update keys in the global settings file, preserving everything else in it.
     pub fn save_global(update: impl FnOnce(&mut serde_json::Map<String, Value>)) -> Result<()> {
         let path = settings_path();
