@@ -62,6 +62,11 @@ enum Command {
     SetAutoCompaction {
         enabled: bool,
     },
+    /// Set the current model's auto-compact window: an exact token count, a size such as
+    /// `"300k"`, or `null`/`"auto"` for the default. Applies to this process only.
+    SetAutoCompactWindow {
+        window: Value,
+    },
     SetAutoRetry {
         enabled: bool,
     },
@@ -237,6 +242,26 @@ fn handle(agent: &Agent, responder: &std::sync::Arc<Responder>, id: Option<Value
         Command::SetAutoCompaction { enabled } => {
             agent.set_auto_compaction(enabled);
             reply(Ok(None));
+        }
+        Command::SetAutoCompactWindow { window } => {
+            let window = match &window {
+                Value::Null => Ok(None),
+                Value::String(text) if text.trim().eq_ignore_ascii_case("auto") => Ok(None),
+                Value::String(text) => crate::config::parse_auto_compact_window(text).map(Some),
+                Value::Number(number) => match number.as_u64() {
+                    Some(tokens) => crate::config::check_auto_compact_window(tokens).map(Some),
+                    None => Err(anyhow::anyhow!("window must be a whole number of tokens")),
+                },
+                _ => Err(anyhow::anyhow!("window must be a token count, a size such as \"300k\", or null")),
+            };
+            reply(window.map(|window| {
+                agent.set_auto_compact_window(window);
+                let snapshot = agent.snapshot();
+                Some(json!({
+                    "autoCompactWindow": snapshot.auto_compact_window,
+                    "compactionThreshold": snapshot.compaction_threshold,
+                }))
+            }));
         }
         Command::SetAutoRetry { enabled } => {
             agent.set_auto_retry(enabled);

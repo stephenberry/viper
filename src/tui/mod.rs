@@ -23,7 +23,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::agent::{Agent, AgentEvent, Busy, CompactionReason, PromptDisposition, QueueMode};
-use crate::config::{Settings, ThinkingLevel, has_credentials};
+use crate::config::{Settings, ThinkingLevel, has_credentials, parse_auto_compact_window};
 use crate::message::{BashExecutionMessage, ContentBlock, Message, StopReason};
 use crate::provider::StreamDelta;
 use editor::Editor;
@@ -42,6 +42,7 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("session", "Show session information", false),
     ("name", "Name the session: /name <name>", true),
     ("compact", "Compact the context: /compact [focus]", false),
+    ("autocompact", "Set when auto-compaction runs: /autocompact <size>|auto|off|on", false),
     ("copy", "Copy the last response to the clipboard", false),
     ("hotkeys", "Show keyboard shortcuts", false),
     ("help", "Show commands", false),
@@ -308,6 +309,9 @@ impl App {
             format_tokens(stats.tokens.input + stats.tokens.cache_read + stats.tokens.cache_write),
             format_tokens(stats.tokens.output)
         );
+        if stats.auto_compact_window.is_some() {
+            right.push_str(&format!(" · compact at {}", format_tokens(stats.compaction_threshold)));
+        }
         if stats.cost > 0.0 {
             right.push_str(&format!(" · ${:.2}", stats.cost));
         }
@@ -1107,6 +1111,7 @@ impl App {
                     let _ = tx.send(AppMsg::CompactDone(result));
                 });
             }
+            "autocompact" => self.autocompact(args),
             "copy" => match self.agent.last_assistant_text() {
                 Some(text) => match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
                     Ok(()) => self.notice = Some("Copied the last response.".into()),
@@ -1117,6 +1122,66 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    /// `/autocompact [<size>|auto|off|on]`: change when auto-compaction runs for the current
+    /// model, saving the choice to the global settings like Claude Code does.
+    fn autocompact(&mut self, args: &str) {
+        let key = self.agent.model().key();
+        let arg = args.trim().to_ascii_lowercase();
+        let saved = match arg.as_str() {
+            "" => Ok(()),
+            "on" | "off" => {
+                let enabled = arg == "on";
+                self.agent.set_auto_compaction(enabled);
+                Settings::save_auto_compaction(enabled)
+            }
+            "auto" => {
+                self.agent.set_auto_compact_window(None);
+                Settings::save_auto_compact_window(&key, None)
+            }
+            size => match parse_auto_compact_window(size) {
+                Ok(window) => {
+                    self.agent.set_auto_compact_window(Some(window));
+                    let enable = (!self.agent.snapshot().auto_compaction_enabled).then(|| {
+                        self.agent.set_auto_compaction(true);
+                        Settings::save_auto_compaction(true)
+                    });
+                    Settings::save_auto_compact_window(&key, Some(window)).and(enable.unwrap_or(Ok(())))
+                }
+                Err(err) => {
+                    self.error(&format!("{err:#}"));
+                    return;
+                }
+            },
+        };
+
+        let snapshot = self.agent.snapshot();
+        let threshold = format_tokens(snapshot.compaction_threshold);
+        let mut text = if !snapshot.auto_compaction_enabled {
+            "Auto-compaction is off.".to_string()
+        } else {
+            match snapshot.auto_compact_window {
+                Some(window) if window > snapshot.compaction_threshold => format!(
+                    "Auto-compaction runs at {threshold} tokens for {key} ({} requested; capped by the model's {} window).",
+                    format_tokens(window),
+                    format_tokens(snapshot.model.context_window)
+                ),
+                Some(_) => format!("Auto-compaction runs at {threshold} tokens for {key}."),
+                None => format!(
+                    "Auto-compaction runs at {threshold} tokens for {key} (auto: the {} window minus room for the response).",
+                    format_tokens(snapshot.model.context_window)
+                ),
+            }
+        };
+        if arg.is_empty() {
+            text.push_str(" Change it with /autocompact <size> (100k–1M), auto, off, or on.");
+        }
+        self.notice(&text);
+        if let Err(err) = saved {
+            self.error(&format!("The change applies to this session but could not be saved: {err:#}"));
+        }
+        self.refresh_footer();
     }
 
     fn show_session(&mut self) {
@@ -1172,7 +1237,11 @@ impl App {
 
     fn open_model_selector(&mut self) {
         let current = self.agent.model().key();
-        let models = self.agent.setup().registry.all();
+        // Models without credentials are listed only when nothing is usable, to explain why.
+        let registry = &self.agent.setup().registry;
+        let available: Vec<&crate::config::Model> = registry.available();
+        let models: Vec<&crate::config::Model> =
+            if available.is_empty() { registry.all().iter().collect() } else { available };
         let items = models
             .iter()
             .map(|m| Item {

@@ -40,9 +40,9 @@ Output flows into your terminal's normal scrollback, so scrolling, selection, an
 - **Enter** sends. While the agent works, Enter steers it (the message is injected after the current tool calls) and **Alt+Enter** queues a follow-up for when it finishes.
 - **Esc** interrupts; queued messages return to the editor.
 - **Shift+Enter**, **Ctrl+J**, or `\` then Enter inserts a newline.
-- **Shift+Tab** cycles the thinking level, **Ctrl+L** picks a model, **Ctrl+G** opens `$VISUAL`/`$EDITOR`, **Ctrl+V** pastes a clipboard image. Dragging an image file into the terminal attaches it.
+- **Shift+Tab** cycles the thinking level, **Ctrl+L** picks a model (only models with credentials are listed), **Ctrl+G** opens `$VISUAL`/`$EDITOR`, **Ctrl+V** pastes a clipboard image. Dragging an image file into the terminal attaches it.
 - `!command` runs a shell command and adds its output to the conversation; `!!command` keeps it out of the model's context.
-- `/help` lists commands: `/model`, `/thinking`, `/new`, `/resume`, `/session`, `/name`, `/compact`, `/copy`, `/hotkeys`, `/quit`, and `/skill:<name>`.
+- `/help` lists commands: `/model`, `/thinking`, `/new`, `/resume`, `/session`, `/name`, `/compact`, `/autocompact`, `/copy`, `/hotkeys`, `/quit`, and `/skill:<name>`.
 
 ## Tools
 
@@ -112,7 +112,7 @@ Model fields: `id`, `name`, `base`, `api`, `contextWindow`, `maxTokens`, `reason
   "defaultModel": "anthropic/claude-opus-5-5",
   "defaultThinkingLevel": "high",
   "tools": ["read", "bash", "edit", "write", "grep", "find", "ls"],
-  "compaction": { "enabled": true, "reserveTokens": 16384, "keepRecentTokens": 20000 },
+  "compaction": { "enabled": true, "reserveTokens": 16384, "keepRecentTokens": 20000, "autoCompactWindow": null },
   "retry": { "enabled": true, "maxRetries": 3, "baseDelayMs": 2000 },
   "shellPath": null,
   "appendSystemPrompt": null,
@@ -125,6 +125,8 @@ Model fields: `id`, `name`, `base`, `api`, `contextWindow`, `maxTokens`, `reason
 
 In the model and thinking pickers, **Ctrl+S** saves the choice as the default.
 
+`modelSettings` holds per-model settings keyed by `provider/model-id`; `/autocompact` writes `autoCompactWindow` there.
+
 ## Context and skills
 
 viper adds `AGENTS.md` (or `CLAUDE.md`) files to the system prompt: the global one in `~/.viper`, then one from each directory between the filesystem root and the working directory.
@@ -135,7 +137,9 @@ Skills follow the [Agent Skills](https://agentskills.io/specification) format: a
 
 Sessions are saved as JSONL in `~/.viper/sessions/` once the first message is sent. `viper -c` continues the latest session for the directory, `viper -r` and `/resume` pick one, and `/name` labels the current one. Resuming restores the session's model and thinking level.
 
-When the context approaches the model's window (within `reserveTokens`), viper summarizes older messages into a structured checkpoint and keeps roughly the last `keepRecentTokens` verbatim. `/compact [focus]` compacts on demand. If a request overflows the context anyway, viper compacts and retries once. The full history stays in the session file.
+When the context approaches the model's window (within `reserveTokens`), viper summarizes older messages into a structured checkpoint and keeps roughly the last `keepRecentTokens` verbatim. `/compact [focus]` compacts on demand.
+
+`/autocompact` changes when auto-compaction runs, as in Claude Code. `/autocompact 300k` compacts the current model's context at 300k tokens instead of near its full window, which keeps long sessions with large-window models cheaper. Sizes from 100k to 1M are accepted (`300k`, `1M`, or `300` for thousands), capped by the model's window. `/autocompact auto` returns to the default, `off` and `on` toggle auto-compaction, and `/autocompact` alone shows the current setting. Choices are saved to `~/.viper/settings.json` per model; `compaction.autoCompactWindow` sets a default for models without one. The footer shows `compact at <size>` when a window is set. If a request overflows the context anyway, viper compacts and retries once. The full history stays in the session file.
 
 Transient API failures (rate limits, overload, server errors, dropped connections) are retried with exponential backoff before any output has streamed.
 
@@ -148,6 +152,6 @@ Transient API failures (rate limits, overload, server errors, dropped connection
 {"type": "response", "command": "prompt", "success": true, "data": {"disposition": {"status": "started"}}, "id": "1"}
 ```
 
-Commands: `prompt` (`message`, optional `images` of `{data, mimeType}`, optional `streamingBehavior`: `steer` or `followUp` when busy), `steer`, `follow_up`, `abort`, `clear_queue`, `new_session`, `get_state`, `set_model` (`provider`, `modelId`), `get_available_models`, `set_thinking_level` (`level`), `cycle_thinking_level`, `get_available_thinking_levels`, `compact` (`customInstructions`), `set_auto_compaction` (`enabled`), `set_auto_retry` (`enabled`), `bash` (`command`, `excludeFromContext`), `abort_bash`, `get_session_stats`, `list_sessions`, `switch_session` (`sessionPath`), `get_last_assistant_text`, `set_session_name` (`name`), `get_messages`, `get_commands`.
+Commands: `prompt` (`message`, optional `images` of `{data, mimeType}`, optional `streamingBehavior`: `steer` or `followUp` when busy), `steer`, `follow_up`, `abort`, `clear_queue`, `new_session`, `get_state`, `set_model` (`provider`, `modelId`), `get_available_models`, `set_thinking_level` (`level`), `cycle_thinking_level`, `get_available_thinking_levels`, `compact` (`customInstructions`), `set_auto_compaction` (`enabled`), `set_auto_compact_window` (`window`: tokens, a size such as `"300k"`, or `null`; not saved), `set_auto_retry` (`enabled`), `bash` (`command`, `excludeFromContext`), `abort_bash`, `get_session_stats`, `list_sessions`, `switch_session` (`sessionPath`), `get_last_assistant_text`, `set_session_name` (`name`), `get_messages`, `get_commands`.
 
 Events (also the `--mode json` output): `agent_start`, `agent_end`, `turn_start`, `turn_end`, `message_start`, `message_update` (with an `assistantMessageEvent` delta: `text_*`, `thinking_*`, `toolcall_*`), `message_end`, `tool_execution_start`, `tool_execution_update`, `tool_execution_end`, `compaction_start`, `compaction_end`, `auto_retry_start`, and `queue_update`.

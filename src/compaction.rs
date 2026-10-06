@@ -75,8 +75,11 @@ pub fn estimate_context_tokens(messages: &[Message]) -> u64 {
     }
 }
 
-pub fn should_compact(context_tokens: u64, context_window: u64, reserve_tokens: u64) -> bool {
-    context_tokens > context_window.saturating_sub(reserve_tokens)
+/// Context size at which auto-compaction triggers: the configured window, capped so the
+/// model always has `reserve_tokens` left for its response.
+pub fn compaction_threshold(context_window: u64, reserve_tokens: u64, configured: Option<u64>) -> u64 {
+    let limit = context_window.saturating_sub(reserve_tokens);
+    configured.map_or(limit, |window| window.min(limit))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -374,7 +377,8 @@ mod tests {
 
     #[test]
     fn threshold() {
-        assert!(should_compact(990_000, 1_000_000, 16_384));
-        assert!(!should_compact(900_000, 1_000_000, 16_384));
+        assert_eq!(compaction_threshold(1_000_000, 16_384, None), 983_616);
+        assert_eq!(compaction_threshold(1_000_000, 16_384, Some(300_000)), 300_000);
+        assert_eq!(compaction_threshold(200_000, 16_384, Some(500_000)), 183_616);
     }
 }

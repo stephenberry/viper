@@ -157,12 +157,57 @@ pub struct CompactionSettings {
     pub reserve_tokens: u64,
     /// Approximate number of recent tokens kept verbatim after compaction.
     pub keep_recent_tokens: u64,
+    /// Context size in tokens at which auto-compaction triggers, for models without their own
+    /// `modelSettings` value. Unset means `contextWindow - reserveTokens`.
+    pub auto_compact_window: Option<u64>,
 }
 
 impl Default for CompactionSettings {
     fn default() -> Self {
-        Self { enabled: true, reserve_tokens: 16_384, keep_recent_tokens: 20_000 }
+        Self { enabled: true, reserve_tokens: 16_384, keep_recent_tokens: 20_000, auto_compact_window: None }
     }
+}
+
+/// Settings for one model, keyed by `provider/model-id` under `modelSettings`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ModelSettings {
+    /// Context size in tokens at which auto-compaction triggers (set with `/autocompact`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_compact_window: Option<u64>,
+}
+
+/// Values `/autocompact` accepts, matching Claude Code.
+const AUTO_COMPACT_WINDOW_RANGE: std::ops::RangeInclusive<u64> = 100_000..=1_000_000;
+
+/// Parse an auto-compact window: a token count (`300000`), a size with a `k` or `M` suffix
+/// (`300k`, `1M`, `1.5M`), or a bare number up to 1000 meaning thousands (`300`).
+pub fn parse_auto_compact_window(input: &str) -> Result<u64> {
+    let text = input.trim().to_ascii_lowercase();
+    let (number, scale) = match text.strip_suffix('k') {
+        Some(number) => (number, Some(1_000.0)),
+        None => match text.strip_suffix('m') {
+            Some(number) => (number, Some(1_000_000.0)),
+            None => (text.as_str(), None),
+        },
+    };
+    let value: f64 = number
+        .trim()
+        .replace('_', "")
+        .parse()
+        .ok()
+        .filter(|v: &f64| v.is_finite() && *v > 0.0)
+        .ok_or_else(|| anyhow!("'{}' is not a token count (try 300k or 1M)", input.trim()))?;
+    let scale = scale.unwrap_or(if value <= 1_000.0 { 1_000.0 } else { 1.0 });
+    check_auto_compact_window((value * scale).round() as u64)
+}
+
+/// Validate an exact auto-compact window in tokens.
+pub fn check_auto_compact_window(tokens: u64) -> Result<u64> {
+    if !AUTO_COMPACT_WINDOW_RANGE.contains(&tokens) {
+        bail!("the auto-compact window must be between 100k and 1M tokens");
+    }
+    Ok(tokens)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,6 +245,8 @@ pub struct Settings {
     pub hide_thinking: bool,
     /// Interactive mode: lines of tool output shown per tool call.
     pub tool_output_lines: usize,
+    /// Per-model settings keyed by `provider/model-id`.
+    pub model_settings: BTreeMap<String, ModelSettings>,
 }
 
 impl Default for Settings {
@@ -216,6 +263,7 @@ impl Default for Settings {
             enable_skills: true,
             hide_thinking: false,
             tool_output_lines: 10,
+            model_settings: BTreeMap::new(),
         }
     }
 }
@@ -231,6 +279,43 @@ impl Settings {
             merge_json(&mut merged, project);
         }
         serde_json::from_value(merged).context("invalid settings")
+    }
+
+    /// Persist a model's auto-compact window in the global settings (`None` removes it).
+    pub fn save_auto_compact_window(model_key: &str, window: Option<u64>) -> Result<()> {
+        Settings::save_global(|map| {
+            let models = map.entry("modelSettings").or_insert_with(|| Value::Object(Default::default()));
+            let Value::Object(models) = models else { return };
+            match window {
+                Some(window) => {
+                    let entry = models.entry(model_key).or_insert_with(|| Value::Object(Default::default()));
+                    if let Value::Object(entry) = entry {
+                        entry.insert("autoCompactWindow".into(), Value::from(window));
+                    }
+                }
+                None => {
+                    if let Some(Value::Object(entry)) = models.get_mut(model_key) {
+                        entry.remove("autoCompactWindow");
+                        if entry.is_empty() {
+                            models.remove(model_key);
+                        }
+                    }
+                }
+            }
+            if models.is_empty() {
+                map.remove("modelSettings");
+            }
+        })
+    }
+
+    /// Persist whether auto-compaction is enabled in the global settings.
+    pub fn save_auto_compaction(enabled: bool) -> Result<()> {
+        Settings::save_global(|map| {
+            let compaction = map.entry("compaction").or_insert_with(|| Value::Object(Default::default()));
+            if let Value::Object(compaction) = compaction {
+                compaction.insert("enabled".into(), Value::Bool(enabled));
+            }
+        })
     }
 
     /// Update keys in the global settings file, preserving everything else in it.
@@ -747,7 +832,8 @@ impl ModelRegistry {
         self.models.iter().filter(|model| has_credentials(model)).collect()
     }
 
-    /// Find a model by `provider/id`, exact id, or unique substring.
+    /// Find a model by `provider/id`, exact id, or unique substring. Substring matches prefer
+    /// models with credentials, so a short query is not ambiguous because of unusable providers.
     pub fn find(&self, query: &str) -> Result<Model> {
         let query = query.trim();
         if let Some(model) = self.models.iter().find(|m| m.key() == query) {
@@ -763,6 +849,8 @@ impl ModelRegistry {
             .iter()
             .filter(|m| m.key().to_lowercase().contains(&needle) || m.name.to_lowercase().contains(&needle))
             .collect();
+        let usable: Vec<&Model> = matches.iter().copied().filter(|m| has_credentials(m)).collect();
+        let matches = if usable.is_empty() { matches } else { usable };
         match matches.as_slice() {
             [] => bail!("no model matches '{query}' (run `viper --list-models`)"),
             [one] => Ok((*one).clone()),
@@ -785,6 +873,19 @@ impl ModelRegistry {
             )
         })
     }
+}
+
+/// Fail with an actionable message when `model` has no usable API key.
+pub fn ensure_credentials(model: &Model) -> Result<()> {
+    if has_credentials(model) {
+        return Ok(());
+    }
+    let expected = model.api_key.as_ref().map(ConfigValue::describe).unwrap_or_else(|| "an apiKey".into());
+    bail!(
+        "no API key for provider '{}' (expected {expected}); choose another model or configure the provider in {}",
+        model.provider,
+        models_path().display()
+    )
 }
 
 pub fn has_credentials(model: &Model) -> bool {
@@ -855,6 +956,28 @@ mod tests {
         let model = resolve_custom_model("litellm", &provider, &config).unwrap();
         assert_eq!(model.headers["x-team"], ConfigValue::Env("TEAM_ID".into()));
         assert_eq!(model.headers["x-env"], ConfigValue::Literal("prod".into()));
+    }
+
+    #[test]
+    fn find_prefers_models_with_credentials() {
+        let builtin = builtin_anthropic_models().into_iter().find(|m| m.id == "claude-sonnet-5-5").unwrap();
+        let unusable = Model { api_key: None, ..builtin.clone() };
+        let usable = Model { provider: "gateway".into(), api_key: Some(ConfigValue::Literal("key".into())), ..builtin };
+        let registry = ModelRegistry::from_models(vec![unusable.clone(), usable]);
+        assert_eq!(registry.find("sonnet-5-5").unwrap().provider, "gateway");
+        assert!(ensure_credentials(&unusable).unwrap_err().to_string().contains("no API key for provider 'anthropic'"));
+    }
+
+    #[test]
+    fn parses_auto_compact_windows() {
+        assert_eq!(parse_auto_compact_window("300k").unwrap(), 300_000);
+        assert_eq!(parse_auto_compact_window("1M").unwrap(), 1_000_000);
+        assert_eq!(parse_auto_compact_window(" 250 ").unwrap(), 250_000);
+        assert_eq!(parse_auto_compact_window("150000").unwrap(), 150_000);
+        assert_eq!(parse_auto_compact_window("0.5m").unwrap(), 500_000);
+        assert!(parse_auto_compact_window("50k").is_err());
+        assert!(parse_auto_compact_window("2M").is_err());
+        assert!(parse_auto_compact_window("lots").is_err());
     }
 
     #[test]

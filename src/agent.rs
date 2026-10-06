@@ -4,7 +4,7 @@
 //! client can keep reading state, queueing messages, and aborting while the model works. State
 //! lives behind a mutex that is only held for short, non-async sections.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -158,6 +158,8 @@ struct State {
     steering: VecDeque<UserMessage>,
     follow_up: VecDeque<UserMessage>,
     auto_compaction: bool,
+    /// Auto-compact windows set per model (`provider/model-id`), from settings and `/autocompact`.
+    auto_compact_windows: BTreeMap<String, u64>,
     auto_retry: bool,
 }
 
@@ -187,6 +189,10 @@ pub struct AgentSnapshot {
     pub session_id: String,
     pub session_name: Option<String>,
     pub auto_compaction_enabled: bool,
+    /// Configured context size at which auto-compaction triggers; `None` means the model default.
+    pub auto_compact_window: Option<u64>,
+    /// Context size at which auto-compaction actually triggers for the current model.
+    pub compaction_threshold: u64,
     pub auto_retry_enabled: bool,
     pub message_count: usize,
     pub pending_message_count: usize,
@@ -207,6 +213,10 @@ pub struct SessionStats {
     /// Estimated tokens in the current context and the model's window.
     pub context_tokens: u64,
     pub context_window: u64,
+    /// Configured auto-compact window for the current model, if any.
+    pub auto_compact_window: Option<u64>,
+    /// Context size at which auto-compaction triggers for the current model.
+    pub compaction_threshold: u64,
 }
 
 fn text_of(message: &UserMessage) -> String {
@@ -231,6 +241,12 @@ impl Agent {
         let thinking = model.clamp_thinking(thinking);
         let state = State {
             auto_compaction: setup.settings.compaction.enabled,
+            auto_compact_windows: setup
+                .settings
+                .model_settings
+                .iter()
+                .filter_map(|(key, settings)| Some((key.clone(), settings.auto_compact_window?)))
+                .collect(),
             auto_retry: setup.settings.retry.enabled,
             model,
             thinking,
@@ -336,6 +352,8 @@ impl Agent {
             session_id: state.session.id().to_string(),
             session_name: state.session.name(),
             auto_compaction_enabled: state.auto_compaction,
+            auto_compact_window: self.configured_window(&state),
+            compaction_threshold: self.threshold(&state),
             auto_retry_enabled: state.auto_retry,
             message_count: state.messages.len(),
             pending_message_count: state.steering.len() + state.follow_up.len(),
@@ -356,6 +374,8 @@ impl Agent {
             cost: 0.0,
             context_tokens: compaction::estimate_context_tokens(&state.messages),
             context_window: state.model.context_window,
+            auto_compact_window: self.configured_window(&state),
+            compaction_threshold: self.threshold(&state),
         };
         stats.cost = stats.tokens.cost.total;
         for message in state.session.all_messages() {
@@ -382,7 +402,9 @@ impl Agent {
 
     // --- Settings -----------------------------------------------------------------------------
 
+    /// Switch models. Fails without changing anything when the model has no API key.
     pub fn set_model(&self, model: Model) -> Result<()> {
+        crate::config::ensure_credentials(&model)?;
         {
             let mut state = self.state();
             state.thinking = model.clamp_thinking(state.thinking);
@@ -418,6 +440,34 @@ impl Agent {
 
     pub fn set_auto_compaction(&self, enabled: bool) {
         self.state().auto_compaction = enabled;
+    }
+
+    /// Set the current model's auto-compact window for this agent; `None` returns to the
+    /// default. Persisting it is the caller's choice.
+    pub fn set_auto_compact_window(&self, window: Option<u64>) {
+        let mut state = self.state();
+        let key = state.model.key();
+        match window {
+            Some(window) => state.auto_compact_windows.insert(key, window),
+            None => state.auto_compact_windows.remove(&key),
+        };
+    }
+
+    fn configured_window(&self, state: &State) -> Option<u64> {
+        state.auto_compact_windows.get(&state.model.key()).copied().or(self
+            .inner
+            .setup
+            .settings
+            .compaction
+            .auto_compact_window)
+    }
+
+    fn threshold(&self, state: &State) -> u64 {
+        compaction::compaction_threshold(
+            state.model.context_window,
+            self.inner.setup.settings.compaction.reserve_tokens,
+            self.configured_window(state),
+        )
     }
 
     pub fn set_auto_retry(&self, enabled: bool) {
@@ -811,12 +861,11 @@ impl Agent {
     // --- Compaction ---------------------------------------------------------------------------
 
     async fn compact_if_needed(&self, cancel: &CancellationToken) {
-        let (enabled, tokens, window) = {
+        let (enabled, tokens, threshold) = {
             let state = self.state();
-            (state.auto_compaction, compaction::estimate_context_tokens(&state.messages), state.model.context_window)
+            (state.auto_compaction, compaction::estimate_context_tokens(&state.messages), self.threshold(&state))
         };
-        let reserve = self.inner.setup.settings.compaction.reserve_tokens;
-        if enabled && compaction::should_compact(tokens, window, reserve) {
+        if enabled && tokens > threshold {
             // Failures are reported through events; the run continues with the full context.
             let _ = self.compact_inner(CompactionReason::Threshold, None, cancel).await;
         }
@@ -1181,6 +1230,29 @@ mod tests {
         }
         assert_eq!(&order[..3], ["start t1", "end t1", "start t2"]);
         assert_eq!(order[3], "start t3", "read-only calls start together");
+    }
+
+    #[test]
+    fn auto_compact_window_is_per_model_and_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut small = model("http://unused", Api::AnthropicMessages);
+        small.context_window = 200_000;
+        let (agent, _events) = agent(small.clone(), dir.path());
+        let reserve = agent.setup().settings.compaction.reserve_tokens;
+        assert_eq!(agent.snapshot().compaction_threshold, 200_000 - reserve);
+
+        agent.set_auto_compact_window(Some(150_000));
+        assert_eq!(agent.snapshot().compaction_threshold, 150_000);
+        agent.set_auto_compact_window(Some(500_000));
+        assert_eq!(agent.snapshot().auto_compact_window, Some(500_000));
+        assert_eq!(agent.snapshot().compaction_threshold, 200_000 - reserve);
+
+        // The window belongs to the model it was set for.
+        let other = Model { id: "other".into(), ..small };
+        agent.set_model(other).unwrap();
+        assert_eq!(agent.snapshot().auto_compact_window, None);
+        agent.set_auto_compact_window(None);
+        assert_eq!(agent.snapshot().compaction_threshold, 200_000 - reserve);
     }
 
     #[tokio::test]

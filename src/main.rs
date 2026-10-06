@@ -152,7 +152,12 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     // Model and thinking level: CLI, then the session's last choice, then settings.
     let mut model = match &cli.model {
         Some(query) => registry.find(query)?,
-        None => match session.last_model().and_then(|(provider, id)| registry.find(&format!("{provider}/{id}")).ok()) {
+        // A resumed session's model is skipped when its credentials are gone.
+        None => match session
+            .last_model()
+            .and_then(|(provider, id)| registry.find(&format!("{provider}/{id}")).ok())
+            .filter(has_credentials)
+        {
             Some(model) => model,
             None => match registry.default_model(&settings) {
                 Ok(model) => model,
@@ -166,6 +171,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         registry.set_api_key(&model.provider, ConfigValue::Literal(key.clone()));
         model.api_key = Some(ConfigValue::Literal(key.clone()));
     }
+    crate::config::ensure_credentials(&model)?;
     let thinking = cli
         .thinking
         .or_else(|| session.last_thinking_level())
