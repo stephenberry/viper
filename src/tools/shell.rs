@@ -25,7 +25,7 @@ impl ShellConfig {
             return ShellConfig { program: crate::config::expand_home(path) };
         }
         if cfg!(windows) {
-            return ShellConfig { program: PathBuf::from("bash") };
+            return ShellConfig { program: find_windows_bash().unwrap_or_else(|| PathBuf::from("bash")) };
         }
         for candidate in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash", "/opt/homebrew/bin/bash"] {
             if Path::new(candidate).exists() {
@@ -34,6 +34,27 @@ impl ShellConfig {
         }
         ShellConfig { program: PathBuf::from("/bin/sh") }
     }
+}
+
+/// Git for Windows' bash, else another `bash.exe` on `PATH` (MSYS2, Cygwin). The `bash.exe` in
+/// System32 is skipped: it starts WSL, which runs commands in a separate Linux system and fails
+/// outright when no distribution is installed.
+fn find_windows_bash() -> Option<PathBuf> {
+    let git_bash = [
+        ("ProgramFiles", r"Git\bin\bash.exe"),
+        ("ProgramFiles(x86)", r"Git\bin\bash.exe"),
+        ("LOCALAPPDATA", r"Programs\Git\bin\bash.exe"),
+    ]
+    .into_iter()
+    .filter_map(|(var, relative)| Some(PathBuf::from(std::env::var_os(var)?).join(relative)));
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let on_path = std::env::split_paths(&path).map(|dir| dir.join("bash.exe")).filter(|p| !is_wsl_launcher(p));
+    git_bash.chain(on_path).find(|p| p.is_file())
+}
+
+fn is_wsl_launcher(path: &Path) -> bool {
+    let path = path.to_string_lossy().replace('/', "\\").to_lowercase();
+    path.ends_with(r"\windows\system32\bash.exe") || path.ends_with(r"\windows\sysnative\bash.exe")
 }
 
 /// Output kept in memory before spilling to a temp file.
@@ -279,6 +300,13 @@ mod tests {
 
     fn shell() -> ShellConfig {
         ShellConfig::resolve(None)
+    }
+
+    #[test]
+    fn recognizes_the_wsl_launcher() {
+        assert!(is_wsl_launcher(Path::new(r"C:\Windows\System32\bash.exe")));
+        assert!(is_wsl_launcher(Path::new("c:/windows/sysnative/BASH.EXE")));
+        assert!(!is_wsl_launcher(Path::new(r"C:\Program Files\Git\bin\bash.exe")));
     }
 
     #[tokio::test]

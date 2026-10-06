@@ -1,7 +1,7 @@
 name: CI
 
 # The repository is private, so Actions minutes are billed: pushes and pull requests run on
-# Linux only. Run the workflow manually to also test on macOS and Windows.
+# Linux only. Run the workflow manually to also test on macOS, Windows, or both.
 on:
   push:
     branches: [main]
@@ -10,13 +10,15 @@ on:
     paths-ignore: ["**.md"]
   workflow_dispatch:
     inputs:
-      all-platforms:
-        description: Also test on macOS and Windows
-        type: boolean
-        default: true
+      platforms:
+        description: Platforms to test besides Linux
+        type: choice
+        options: [all, macos, windows]
+        default: all
 
+# A newer run of the same kind replaces an older one; a manual run never cancels a push run.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -55,11 +57,11 @@ jobs:
 
   platforms:
     name: Test (${{ matrix.os }})
-    if: github.event_name == 'workflow_dispatch' && inputs.all-platforms
+    if: github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        os: ${{ fromJSON(inputs.platforms == 'all' && '["macos-latest", "windows-latest"]' || format('["{0}-latest"]', inputs.platforms)) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:

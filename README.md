@@ -171,6 +171,6 @@ Events (also the `--mode json` output, which starts with a `session` line giving
 
 ## Development
 
-`cargo test` runs the test suite; CI also checks `cargo fmt` and `cargo clippy`. Pushes and pull requests are tested on Linux; run the CI workflow manually to also test on macOS and Windows.
+`cargo test` runs the test suite; CI also checks `cargo fmt` and `cargo clippy`. Pushes and pull requests are tested on Linux; run the CI workflow manually to also test on macOS, Windows, or both.
 
 To release, set `version` in `Cargo.toml`, commit, and push a matching tag (`git tag v0.2.0 && git push origin v0.2.0`). The release workflow builds the binaries and publishes the release.
