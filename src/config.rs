@@ -100,7 +100,10 @@ fn read_json_file(path: &Path) -> Result<Option<Value>> {
 
 /// Update the JSON object in `path`, keeping whatever `update` leaves alone. A missing file
 /// starts as `{}`.
-fn update_json_object(path: &Path, update: impl FnOnce(&mut Map<String, Value>) -> Result<()>) -> Result<()> {
+pub(crate) fn update_json_object(
+    path: &Path,
+    update: impl FnOnce(&mut Map<String, Value>) -> Result<()>,
+) -> Result<()> {
     let mut value = read_json_file(path)?.unwrap_or_else(|| Value::Object(Map::new()));
     let Value::Object(map) = &mut value else {
         bail!("{} must contain a JSON object", path.display());
@@ -757,6 +760,12 @@ fn short_model_name(id: &str) -> String {
 /// The built-in model a gateway model id refers to: the id itself, its last path segment
 /// (`anthropic/claude-opus-5-5`), or its last dotted segment (Bedrock's
 /// `us.anthropic.claude-opus-5-5`).
+/// Whether `id` names a built-in Claude model, so a configured model with it inherits that
+/// model's metadata.
+pub fn names_builtin_model(id: &str) -> bool {
+    inferred_builtin(id).is_some()
+}
+
 fn inferred_builtin(id: &str) -> Option<&'static BuiltinModel> {
     let segment = id.rsplit('/').next().unwrap_or(id);
     builtin(id).or_else(|| builtin(segment)).or_else(|| builtin(segment.rsplit('.').next().unwrap_or(segment)))

@@ -4,11 +4,13 @@ A minimal coding agent for the terminal, written in Rust. viper is modeled on [p
 
 ## Install
 
+Each [GitHub release](https://github.com/stephenberry/viper/releases) has prebuilt binaries: static Linux builds (x86_64 and arm64), a universal macOS build, and Windows (x86_64), with SHA-256 checksums in `SHA256SUMS`. Unpack the archive and put `viper` on your `PATH`.
+
+To build from source (Rust 1.96 or newer):
+
 ```bash
 cargo install --path .
 ```
-
-Requires Rust 1.96 or newer.
 
 ## Quick start
 
@@ -31,7 +33,7 @@ The default model is Claude Opus 5.5 at the `high` thinking level. `viper --list
 
 Arguments starting with `@` attach files (`viper @src/main.rs "explain this"`); images are sent as images. In print and JSON modes, piped stdin is prepended to the prompt.
 
-Common options: `-m/--model <provider/id>`, `--thinking <level>`, `-c/--continue`, `-r/--resume`, `--session <file>`, `--no-session`, `--tools read,bash,...`, `--no-tools`, `--no-skills`, `--system-prompt`, `--append-system-prompt`, `--api-key`, `--cwd`. See `viper --help`.
+Common options: `-m/--model <provider/id>`, `--thinking <level>`, `-c/--continue`, `-r/--resume`, `--session <file>`, `--no-session`, `--tools read,bash,...`, `--no-tools`, `--no-skills`, `--system-prompt`, `--append-system-prompt`, `--api-key`, `--cwd`, `--list-models`, `--sync-models <provider>`. See `viper --help`.
 
 ## Interactive use
 
@@ -42,7 +44,7 @@ Output flows into your terminal's normal scrollback, so scrolling, selection, an
 - **Shift+Enter**, **Ctrl+J**, or `\` then Enter inserts a newline.
 - **Shift+Tab** cycles the thinking level, **Ctrl+L** picks a model (only models with credentials are listed), **Ctrl+G** opens `$VISUAL`/`$EDITOR`, **Ctrl+V** pastes a clipboard image. Dragging an image file into the terminal attaches it.
 - `!command` runs a shell command and adds its output to the conversation; `!!command` keeps it out of the model's context.
-- `/help` lists commands: `/model`, `/thinking`, `/new`, `/resume`, `/session`, `/name`, `/compact`, `/autocompact`, `/login`, `/copy`, `/hotkeys`, `/quit`, and `/skill:<name>`.
+- `/help` lists commands: `/model`, `/thinking`, `/new`, `/resume`, `/session`, `/name`, `/compact`, `/autocompact`, `/login`, `/sync-models`, `/copy`, `/hotkeys`, `/quit`, and `/skill:<name>`.
 
 ## Tools
 
@@ -85,7 +87,7 @@ Without a `models` list, only `baseUrl`, `apiKey`, `authHeader`, and `headers` a
 
 ### LiteLLM
 
-Run `/login litellm` (or add `baseUrl` yourself), then list the gateway's models in `models.json`. Each model talks to the gateway through either its Anthropic-compatible endpoint (`/v1/messages`) or its OpenAI-compatible endpoint (`/v1/chat/completions`), chosen per model with `api`:
+Run `/login litellm` (or add `baseUrl` yourself), then run `/sync-models litellm` (or `viper --sync-models litellm`) to add the gateway's models to `models.json`, or list them yourself. Each model talks to the gateway through either its Anthropic-compatible endpoint (`/v1/messages`) or its OpenAI-compatible endpoint (`/v1/chat/completions`), chosen per model with `api`:
 
 ```json
 {
@@ -111,6 +113,8 @@ viper identifies models as `provider/id`. To list the same gateway model twice (
 Provider fields: `baseUrl`, `apiKey`, `api` (`anthropic-messages` or `openai-completions`), `authHeader` (`bearer`, the default for custom providers, or `xapikey`), `headers`.
 
 Model fields: `id`, `alias`, `name`, `base`, `api`, `contextWindow`, `maxTokens`, `reasoning` (`adaptive`, `budget`, `effort`, `none`), `thinkingLevels`, `images`, `cost` (`input`, `output`, `cacheRead`, `cacheWrite` in dollars per million tokens), `cacheControl`, `eagerInputStreaming`, `headers`, and `extraBody` (fields merged into every request body).
+
+`/sync-models <provider>` lists the server's models (`GET /v1/models`) and adds the ones `models.json` does not have yet. With LiteLLM, each new entry also gets the context window, output limit, prices, and image and reasoning support that the gateway reports. Models named after a built-in Claude model keep the provider's `api` and inherit the rest; other models use `openai-completions`. Existing entries are never changed, and configured models the server no longer lists are only reported.
 
 `apiKey` and header values accept `$VAR` or `${VAR}`, `!command` (the command's output, run per request), or a literal.
 
@@ -164,3 +168,9 @@ Transient API failures (rate limits, overload, server errors, dropped connection
 Commands: `prompt` (`message`, optional `images` of `{data, mimeType}`, optional `streamingBehavior`: `steer` or `followUp` when busy), `steer`, `follow_up`, `abort`, `clear_queue`, `new_session`, `get_state`, `set_model` (`provider`, `modelId`), `get_available_models`, `set_thinking_level` (`level`), `cycle_thinking_level`, `get_available_thinking_levels`, `compact` (`customInstructions`), `set_auto_compaction` (`enabled`), `set_auto_compact_window` (`window`: tokens, a size such as `"300k"`, or `null` or `"auto"` for the default; not saved), `set_auto_retry` (`enabled`), `bash` (`command`, `excludeFromContext`), `abort_bash`, `get_session_stats`, `list_sessions`, `switch_session` (`sessionPath`), `get_last_assistant_text`, `set_session_name` (`name`), `get_messages`, `get_commands`.
 
 Events (also the `--mode json` output, which starts with a `session` line giving the session id, file, model, and thinking level): `agent_start`, `agent_end`, `turn_start`, `turn_end`, `message_start`, `message_update` (with an `assistantMessageEvent` delta: `text_*`, `thinking_*`, `toolcall_*`), `message_end`, `tool_execution_start`, `tool_execution_update`, `tool_execution_end`, `compaction_start`, `compaction_end`, `auto_retry_start`, and `queue_update`.
+
+## Development
+
+`cargo test` runs the test suite; CI also checks `cargo fmt` and `cargo clippy`. Pushes and pull requests are tested on Linux; run the CI workflow manually to also test on macOS and Windows.
+
+To release, set `version` in `Cargo.toml`, commit, and push a matching tag (`git tag v0.2.0 && git push origin v0.2.0`). The release workflow builds the binaries and publishes the release.

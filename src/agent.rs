@@ -220,10 +220,7 @@ impl Agent {
         session: SessionStore,
         events: mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<Agent> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(30))
-            .user_agent(concat!("viper/", env!("CARGO_PKG_VERSION")))
-            .build()?;
+        let client = provider::http_client()?;
         let shell = ShellConfig::resolve(setup.settings.shell_path.as_deref());
         let tool_specs = setup.tools.iter().map(|t| t.spec()).collect();
         let messages = session.messages();

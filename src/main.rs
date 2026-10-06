@@ -6,6 +6,7 @@ mod config;
 mod context;
 mod images;
 mod message;
+mod model_sync;
 mod modes;
 mod provider;
 mod session;
@@ -119,6 +120,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
 
     if let Some(filter) = &cli.list_models {
         list_models(&registry, filter);
+        return Ok(ExitCode::SUCCESS);
+    }
+    if let Some(provider) = &cli.sync_models {
+        let report = model_sync::sync(&provider::http_client()?, &registry, provider).await?;
+        println!("{}", report.describe(provider));
         return Ok(ExitCode::SUCCESS);
     }
 

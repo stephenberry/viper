@@ -82,6 +82,10 @@ pub struct Cli {
     #[arg(long, num_args = 0..=1, default_missing_value = "")]
     pub list_models: Option<String>,
 
+    /// Add the models a provider's server offers to models.json and exit.
+    #[arg(long, value_name = "PROVIDER")]
+    pub sync_models: Option<String>,
+
     /// Working directory.
     #[arg(long)]
     pub cwd: Option<PathBuf>,

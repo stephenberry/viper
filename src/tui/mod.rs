@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures::StreamExt;
 use serde_json::Value;
@@ -27,6 +27,7 @@ use crate::agent::{Agent, AgentEvent, Busy, CompactionReason, QueueMode};
 use crate::auth::{AuthStore, auth_path};
 use crate::config::{Model, ModelRegistry, Settings, ThinkingLevel, has_credentials, parse_auto_compact_window};
 use crate::message::{BashExecutionMessage, ContentBlock, Message, StopReason};
+use crate::model_sync::SyncReport;
 use crate::provider::{CredentialCheck, StreamDelta};
 use editor::Editor;
 use markdown::MarkdownRenderer;
@@ -47,6 +48,7 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("compact", "Compact the context: /compact [focus]", false),
     ("autocompact", "Set when auto-compaction runs: /autocompact <size>|auto|off|on", false),
     ("login", "Save a provider's base URL and API key: /login <provider>", true),
+    ("sync-models", "Add a provider's new server models to models.json: /sync-models <provider>", true),
     ("copy", "Copy the last response to the clipboard", false),
     ("hotkeys", "Show keyboard shortcuts", false),
     ("help", "Show commands", false),
@@ -77,6 +79,7 @@ enum AppMsg {
     BashUpdate(String),
     BashDone(Result<BashExecutionMessage>),
     LoginChecked(Box<CheckedLogin>),
+    ModelsSynced(String, Result<SyncReport>),
 }
 
 enum StreamKind {
@@ -738,6 +741,17 @@ impl App {
                 self.refresh_footer();
             }
             AppMsg::LoginChecked(login) => self.finish_login(*login),
+            AppMsg::ModelsSynced(provider, result) => {
+                self.notice = None;
+                match result.and_then(|report| Ok((report, ModelRegistry::load()?))) {
+                    Ok((report, registry)) => {
+                        self.agent.set_registry(registry);
+                        self.notice(&report.describe(&provider));
+                    }
+                    Err(err) => self.error(&format!("Could not sync {provider}'s models: {err:#}")),
+                }
+                self.refresh_footer();
+            }
         }
     }
 
@@ -1121,6 +1135,7 @@ impl App {
             }
             "autocompact" => self.autocompact(args)?,
             "login" => self.start_login(args),
+            "sync-models" => self.sync_models(args)?,
             "copy" => match self.agent.last_assistant_text() {
                 Some(text) => match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
                     Ok(()) => self.notice = Some("Copied the last response.".into()),
@@ -1188,6 +1203,22 @@ impl App {
             self.error(&format!("The change applies to this session but could not be saved: {err:#}"));
         }
         self.refresh_footer();
+        Ok(())
+    }
+
+    /// `/sync-models <provider>`: add the models the provider's server offers to models.json.
+    fn sync_models(&mut self, args: &str) -> Result<()> {
+        let registry = self.agent.registry();
+        let provider = args.trim();
+        if provider.is_empty() || provider.contains(char::is_whitespace) {
+            bail!("Usage: /sync-models <provider> (configured: {})", registry.providers().join(", "));
+        }
+        self.notice = Some(format!("Listing the models {provider} offers…"));
+        let (client, tx, provider) = (self.agent.http_client().clone(), self.app_tx.clone(), provider.to_string());
+        tokio::spawn(async move {
+            let result = crate::model_sync::sync(&client, &registry, &provider).await;
+            let _ = tx.send(AppMsg::ModelsSynced(provider, result));
+        });
         Ok(())
     }
 

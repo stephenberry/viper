@@ -131,7 +131,7 @@ fn extract_error_message(body: &str) -> String {
 }
 
 /// `path` under the API's `/v1` prefix, which `base_url` may already end with.
-fn v1_url(base_url: &str, path: &str) -> String {
+pub(crate) fn v1_url(base_url: &str, path: &str) -> String {
     let base = base_url.trim_end_matches('/');
     let base = base.strip_suffix("/v1").unwrap_or(base);
     format!("{base}/v1/{path}")
@@ -172,6 +172,14 @@ pub fn new_assistant_message(model: &Model, thinking: ThinkingLevel) -> Assistan
 
 pub type DeltaSink<'a> = dyn FnMut(&AssistantMessage, StreamDelta) + Send + 'a;
 
+/// The HTTP client for model servers.
+pub fn http_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .user_agent(concat!("viper/", env!("CARGO_PKG_VERSION")))
+        .build()
+}
+
 /// Stream one model response into `out`.
 ///
 /// On success `out.stop_reason` is set from the provider. On failure `out` holds whatever was
@@ -203,7 +211,7 @@ pub async fn stream(
 }
 
 /// Apply authentication and custom headers. Headers whose environment variable is unset are omitted.
-fn apply_auth(
+pub(crate) fn apply_auth(
     builder: reqwest::RequestBuilder,
     model: &Model,
     api_key: &str,
@@ -267,7 +275,7 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 }
 
 /// Send the request and return the response if it succeeded.
-async fn send(
+pub(crate) async fn send(
     builder: reqwest::RequestBuilder,
     cancel: &CancellationToken,
 ) -> Result<reqwest::Response, ProviderError> {
