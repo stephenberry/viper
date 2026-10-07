@@ -1,9 +1,9 @@
 //! A provider's report of how much its API key has spent and may still spend.
 //!
-//! Gateways that cap spending report it at an endpoint of their own, set per provider as
-//! `budgetUrl` in models.json. The response uses LiteLLM's field names (`spend`, `max_budget`,
-//! `budget_duration`, `budget_reset_at`), at the top level or, as in LiteLLM's `/key/info`, under
-//! `info`; a `remaining` field is used when present.
+//! Gateways that cap spending report it at an endpoint, set per provider as `budgetUrl` in
+//! models.json; without one, the common endpoints in `DEFAULT_PATHS` are tried. The response uses
+//! LiteLLM's field names (`spend`, `max_budget`, `budget_duration`, `budget_reset_at`), at the top
+//! level or, as in LiteLLM's `/key/info`, under `info`; a `remaining` field is used when present.
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
@@ -26,19 +26,42 @@ pub struct Budget {
     pub reset_at: Option<String>,
 }
 
+/// Tried in order, on the base URL's host, for a provider without a `budgetUrl`: the calling
+/// key's budget as some gateways report it, then LiteLLM's key information.
+const DEFAULT_PATHS: &[&str] = &["/me/budget", "/key/info"];
+
 /// Ask `model`'s provider for its budget, authenticating as model requests do.
 pub async fn fetch(client: &reqwest::Client, model: &Model) -> Result<Budget> {
-    let Some(budget_url) = &model.budget_url else {
-        bail!("provider '{}' has no budget endpoint; set \"budgetUrl\" for it in models.json", model.provider);
-    };
-    let url = resolve_url(&model.base_url, budget_url)?;
     let api_key = match &model.api_key {
         Some(source) => source.resolve()?,
         None => None,
     }
     .ok_or_else(|| anyhow!("no API key for provider '{}'; run /login {} first", model.provider, model.provider))?;
+    if let Some(budget_url) = &model.budget_url {
+        return fetch_from(client, model, &api_key, budget_url).await;
+    }
+    // The built-in provider is Anthropic's API, which reports no budget.
+    if model.provider == "anthropic" {
+        bail!("Anthropic's API does not report a budget");
+    }
+    let mut failures = Vec::new();
+    for path in DEFAULT_PATHS {
+        match fetch_from(client, model, &api_key, path).await {
+            Ok(budget) => return Ok(budget),
+            Err(err) => failures.push(format!("{path}: {err:#}")),
+        }
+    }
+    bail!(
+        "found no budget endpoint ({}); set \"budgetUrl\" for provider '{}' in models.json",
+        failures.join("; "),
+        model.provider
+    )
+}
+
+async fn fetch_from(client: &reqwest::Client, model: &Model, api_key: &str, budget_url: &str) -> Result<Budget> {
+    let url = resolve_url(&model.base_url, budget_url)?;
     let builder = client.get(url.clone()).timeout(std::time::Duration::from_secs(30));
-    let response = send(apply_auth(builder, model, &api_key)?, &CancellationToken::new()).await?;
+    let response = send(apply_auth(builder, model, api_key)?, &CancellationToken::new()).await?;
     let body: Value = response.json().await.with_context(|| format!("unexpected response from {url}"))?;
     parse(&body).with_context(|| format!("unexpected response from {url}"))
 }
@@ -97,6 +120,25 @@ mod tests {
         assert_eq!(parse(&json!({"error": "token revoked"})).unwrap_err().to_string(), "token revoked");
         assert_eq!(parse(&json!({"error": {"message": "nope"}})).unwrap_err().to_string(), "nope");
         assert!(parse(&json!({"max_budget": 5.0})).is_err());
+    }
+
+    #[tokio::test]
+    async fn tries_common_endpoints_without_a_budget_url() {
+        use crate::config::ConfigValue;
+        use crate::testing::{MockResponse, MockServer};
+        let key_info = json!({"info": {"spend": 4.0, "max_budget": 10.0}}).to_string();
+        let server = MockServer::start(vec![
+            MockResponse::error(404, "not found"),
+            MockResponse { status: 200, body: key_info },
+        ])
+        .await;
+        let model = crate::config::Model {
+            api_key: Some(ConfigValue::Literal("k".into())),
+            ..crate::config::Model::connection("gw", &server.url)
+        };
+        let budget = fetch(&reqwest::Client::new(), &model).await.unwrap();
+        assert_eq!((budget.spend, budget.remaining), (4.0, Some(6.0)));
+        assert_eq!(server.requests.lock().unwrap().len(), 2);
     }
 
     #[test]

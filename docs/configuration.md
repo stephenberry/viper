@@ -77,12 +77,14 @@ Models are identified as `provider/id`. To list the same gateway model twice (fo
 
 ## Budgets
 
-If your gateway caps how much a key may spend, set `budgetUrl` on its provider to the endpoint that reports it, and `/budget` shows what you have spent and have left. A full URL is used as is; a path such as `/key/info` is on the host of `baseUrl`. viper calls it with the provider's API key and reads LiteLLM's field names (`spend`, `max_budget`, `budget_duration`, `budget_reset_at`, and `remaining` if present), at the top level or under `info` as in LiteLLM's `/key/info`:
+If your gateway caps how much a key may spend, `/budget` shows what you have spent and have left. viper asks the gateway with the provider's API key, trying `/me/budget` and then LiteLLM's `/key/info` on the host of `baseUrl`, and reads LiteLLM's field names (`spend`, `max_budget`, `budget_duration`, `budget_reset_at`, and `remaining` if present), at the top level or under `info`.
+
+If your gateway reports the budget elsewhere, set `budgetUrl` on its provider: a full URL is used as is, and a path such as `/budget/info` is on the host of `baseUrl`.
 
 ```json
 {
   "providers": {
-    "litellm": { "baseUrl": "https://litellm.example.com", "budgetUrl": "/key/info", "models": [] }
+    "litellm": { "baseUrl": "https://litellm.example.com", "budgetUrl": "/budget/info", "models": [] }
   }
 }
 ```

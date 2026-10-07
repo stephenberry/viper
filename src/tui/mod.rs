@@ -1290,9 +1290,6 @@ impl App {
         let model = registry.provider_model(&provider).cloned().ok_or_else(|| {
             anyhow::anyhow!("Unknown provider '{provider}' (configured: {})", registry.providers().join(", "))
         })?;
-        if model.budget_url.is_none() {
-            bail!("{provider} has no budget endpoint; set \"budgetUrl\" for it in models.json");
-        }
         self.notice = Some(format!("Checking {provider}'s budget…"));
         let (client, tx) = (self.agent.http_client().clone(), self.app_tx.clone());
         tokio::spawn(async move {
