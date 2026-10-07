@@ -18,7 +18,6 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::cache_warming;
 use crate::compaction::{self, CompactionResult};
 use crate::config::{CacheRetention, CacheWarming, Model, ModelRegistry, Settings, ThinkingLevel};
 use crate::context::{ContextFile, Skill};
@@ -26,6 +25,7 @@ use crate::message::{
     AssistantMessage, BashExecutionMessage, ContentBlock, Message, StopReason, ToolCallRef, ToolResultMessage, Usage,
     UserMessage, now_ms,
 };
+use crate::prompt_cache;
 use crate::provider::{self, ErrorKind, Request, StreamDelta, ToolSpec};
 use crate::session::{Entry, SessionStore, UsageKind, iso_now, new_entry_id};
 use crate::tools::{ShellConfig, Tool, ToolContext, ToolOutput, UpdateFn};
@@ -103,7 +103,7 @@ pub enum AgentEvent {
         steering: Vec<String>,
         follow_up: Vec<String>,
     },
-    /// The prompt cache was refreshed before it expired, at this cost (see `cache_warming`).
+    /// The prompt cache was refreshed before it expired, at this cost (see `prompt_cache`).
     CacheWarm {
         usage: Usage,
     },
@@ -156,7 +156,7 @@ struct State {
     auto_retry: bool,
     /// Replaces the cache lifetime and refresh delay of the configured retention.
     #[cfg(test)]
-    cache_timing: Option<cache_warming::Timing>,
+    cache_timing: Option<prompt_cache::Timing>,
 }
 
 /// A model request as sent, so it can be repeated to refresh its cached prefix.
@@ -398,6 +398,25 @@ impl Agent {
             }
         }
         stats
+    }
+
+    /// The current model's expired prompt cache, when the next message would pay notably more to
+    /// write it again than to read it (see `prompt_cache::stale_cache`).
+    pub fn stale_cache(&self) -> Option<prompt_cache::StaleCache> {
+        let state = self.state();
+        let last = state.messages.iter().rev().find_map(|message| match message {
+            Message::Assistant(assistant) => Some(assistant),
+            _ => None,
+        })?;
+        let model = &state.model;
+        // Another model has no cache entry for this context anyway.
+        if last.provider != model.provider || last.model != model.id {
+            return None;
+        }
+        // The request that produced `last` used the cache when it started, at its timestamp.
+        let idle = Duration::from_millis(u64::try_from(now_ms() - last.timestamp).unwrap_or(0));
+        let retention = prompt_cache::applied_retention(self.inner.setup.settings.cache_retention, &last.usage);
+        prompt_cache::stale_cache(model, retention, last.usage.context_tokens(), idle)
     }
 
     pub fn last_assistant_text(&self) -> Option<String> {
@@ -830,7 +849,7 @@ impl Agent {
     }
 
     /// While tools run, refresh the cached prefix of `sent` shortly before it expires whenever
-    /// that is cheaper than rewriting it (see `cache_warming`). Never returns; the caller drops it
+    /// that is cheaper than rewriting it (see `prompt_cache`). Never returns; the caller drops it
     /// when the tools finish.
     async fn keep_cache_warm(
         &self,
@@ -839,16 +858,16 @@ impl Agent {
         cancel: &CancellationToken,
     ) -> std::convert::Infallible {
         let enabled = self.inner.setup.settings.cache_warming == CacheWarming::Streaming;
-        let retention = cache_warming::applied_retention(sent.retention, usage);
+        let retention = prompt_cache::applied_retention(sent.retention, usage);
         let prompt_tokens = usage.input + usage.cache_read + usage.cache_write;
         let timing = self.cache_timing(retention);
-        if let Some(timing) = timing
-            .filter(|_| enabled && cache_warming::worthwhile(&sent.model, sent.thinking, retention, prompt_tokens))
+        if let Some(timing) =
+            timing.filter(|_| enabled && prompt_cache::worthwhile(&sent.model, sent.thinking, retention, prompt_tokens))
         {
             let mut last_used = sent.started;
             loop {
                 let due = last_used + timing.delay;
-                if due > sent.started + cache_warming::MAX_WARMING_AGE {
+                if due > sent.started + prompt_cache::MAX_WARMING_AGE {
                     break;
                 }
                 tokio::time::sleep_until(due.into()).await;
@@ -866,12 +885,12 @@ impl Agent {
         std::future::pending().await
     }
 
-    fn cache_timing(&self, retention: CacheRetention) -> Option<cache_warming::Timing> {
+    fn cache_timing(&self, retention: CacheRetention) -> Option<prompt_cache::Timing> {
         #[cfg(test)]
         if let Some(timing) = self.state().cache_timing {
             return Some(timing);
         }
-        cache_warming::Timing::for_ttl(retention.ttl())
+        prompt_cache::Timing::for_ttl(retention.ttl())
     }
 
     /// Repeat `sent` with a one-token output limit, which reads its cached prefix and so renews
@@ -1290,6 +1309,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn notices_an_expired_cache_of_the_current_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = model("http://unused", Api::AnthropicMessages);
+        let (agent, _events) = agent(model.clone(), dir.path());
+        let reply = |minutes_ago: i64, model_id: &str| {
+            let mut reply = provider::new_assistant_message(&model, ThinkingLevel::High);
+            reply.model = model_id.to_string();
+            reply.usage = Usage { cache_read: 400_000, output: 1_000, ..Default::default() };
+            reply.timestamp = now_ms() - minutes_ago * 60_000;
+            Message::Assistant(reply)
+        };
+        assert_eq!(agent.stale_cache(), None);
+
+        agent.state().messages.push(reply(3, &model.id));
+        assert_eq!(agent.stale_cache(), None);
+        agent.state().messages.push(reply(12, &model.id));
+        let stale = agent.stale_cache().unwrap();
+        assert_eq!(stale.tokens, 401_000);
+        assert_eq!(stale.idle.as_secs() / 60, 12);
+        // A context last sent to another model has no cache entry for this one to lose.
+        agent.state().messages.push(reply(12, "claude-sonnet-5-5"));
+        assert_eq!(agent.stale_cache(), None);
+    }
+
     #[tokio::test]
     async fn keeps_the_prompt_cache_warm_while_a_tool_runs() {
         // The request before the tool call wrote a 100k-token cache entry: worth keeping.
@@ -1315,7 +1359,7 @@ mod tests {
         let (agent, mut events) =
             agent_with_tools(model(&server.url, Api::AnthropicMessages), dir.path(), vec![Arc::new(tool)]);
         agent.state().cache_timing =
-            Some(cache_warming::Timing { ttl: Duration::from_secs(5), delay: Duration::from_millis(200) });
+            Some(prompt_cache::Timing { ttl: Duration::from_secs(5), delay: Duration::from_millis(200) });
         agent_slot.set(agent.clone()).ok();
 
         agent.prompt(vec![ContentBlock::text("wait")], None).unwrap();

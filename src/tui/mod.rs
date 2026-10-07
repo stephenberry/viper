@@ -148,6 +148,9 @@ struct App {
     streaming_tool: Option<(String, usize)>,
     running_tools: Vec<RunningTool>,
     busy_since: Option<Instant>,
+    /// Shown under the input while the prompt cache has expired and the next message would pay
+    /// notably more to rewrite it (`refresh_stale_cache_hint`).
+    stale_cache_hint: Option<String>,
     status: Option<String>,
     bash_live: Option<(String, String)>,
     queued: (Vec<String>, Vec<String>),
@@ -221,6 +224,16 @@ fn format_tokens(n: u64) -> String {
     }
 }
 
+/// The warning under the input while the prompt cache has expired.
+fn stale_cache_hint(stale: &crate::prompt_cache::StaleCache) -> String {
+    format!(
+        "Cache expired: your next message re-sends {} tokens for ~${:.2} (${:.2} cached) · /compact to shrink",
+        format_tokens(stale.tokens),
+        stale.rewrite_cost,
+        stale.cached_cost
+    )
+}
+
 fn relative_time(time: std::time::SystemTime) -> String {
     let secs = std::time::SystemTime::now().duration_since(time).map_or(0, |elapsed| elapsed.as_secs());
     match secs {
@@ -264,6 +277,7 @@ impl App {
             streaming_tool: None,
             running_tools: Vec::new(),
             busy_since: None,
+            stale_cache_hint: None,
             status: None,
             bash_live: None,
             queued: (Vec::new(), Vec::new()),
@@ -369,6 +383,8 @@ impl App {
             right.push_str(&format!(" · {thinking}"));
         }
         self.footer = (left, right);
+        // The model, the context, or the agent's state may have changed.
+        self.refresh_stale_cache_hint();
     }
 
     fn footer_line(&self, width: usize) -> String {
@@ -529,6 +545,9 @@ impl App {
         lines.push(border);
         let suggestions = self.suggestions();
         if suggestions.is_empty() {
+            if let Some(hint) = self.stale_cache_hint.as_ref().filter(|_| busy.is_none()) {
+                lines.push(paint(YELLOW, &truncate(hint, width)));
+            }
             lines.push(self.footer_line(width));
         } else {
             let selected = self.suggestion.min(suggestions.len() - 1);
@@ -643,7 +662,10 @@ impl App {
 
     fn on_agent(&mut self, event: AgentEvent) {
         match event {
-            AgentEvent::AgentStart => self.busy_since = Some(Instant::now()),
+            AgentEvent::AgentStart => {
+                self.busy_since = Some(Instant::now());
+                self.stale_cache_hint = None;
+            }
             AgentEvent::AgentEnd { .. } => {
                 self.busy_since = None;
                 self.status = None;
@@ -1103,6 +1125,16 @@ impl App {
         let content = crate::modes::expand_skill(&self.agent, content)?;
         self.agent.prompt(content, queue)?;
         Ok(())
+    }
+
+    /// Update the hint shown when the prompt cache has expired; returns whether it changed. While
+    /// the agent works, its cache is warm.
+    fn refresh_stale_cache_hint(&mut self) -> bool {
+        let stale = if self.agent.busy().is_none() { self.agent.stale_cache() } else { None };
+        let hint = stale.map(|stale| stale_cache_hint(&stale));
+        let changed = hint != self.stale_cache_hint;
+        self.stale_cache_hint = hint;
+        changed
     }
 
     // --- Commands -----------------------------------------------------------------------------
@@ -1641,6 +1673,9 @@ pub async fn run(
     let mut terminal_events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(80));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The cache expires while nothing happens on screen, so check for that on a timer.
+    let mut stale_cache_check = tokio::time::interval(Duration::from_secs(1));
+    stale_cache_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut dirty = true;
     loop {
         if dirty {
@@ -1673,6 +1708,11 @@ pub async fn run(
             _ = tick.tick() => {
                 if app.animating() || app.status.is_some() {
                     app.spinner += 1;
+                    dirty = true;
+                }
+            }
+            _ = stale_cache_check.tick() => {
+                if app.refresh_stale_cache_hint() {
                     dirty = true;
                 }
             }
@@ -1725,6 +1765,20 @@ pub async fn pick_session(cwd: &Path) -> Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn describes_an_expired_cache() {
+        let stale = crate::prompt_cache::StaleCache {
+            idle: Duration::from_secs(720),
+            tokens: 401_000,
+            rewrite_cost: 2.0,
+            cached_cost: 0.08,
+        };
+        assert_eq!(
+            stale_cache_hint(&stale),
+            "Cache expired: your next message re-sends 401k tokens for ~$2.00 ($0.08 cached) · /compact to shrink"
+        );
+    }
 
     #[test]
     fn formats_token_counts() {

@@ -116,6 +116,8 @@ A cache entry expires 5 minutes after it was last used; writing it costs 1.25x t
 
 When a tool call runs longer than the cache lasts, the next request would have to write the whole conversation to the cache again. With `"cacheWarming": "streaming"` (the default), viper refreshes the cache shortly before it expires by repeating the last request with a one-token reply, but only when that is expected to save at least $0.05. Refreshes count toward the session's cost; `"off"` turns them off. They are skipped for models without prices, models that think within a fixed budget, and gateway models with thinking on, whose cache a repeated request might not reuse.
 
+After a long pause the cache has expired, and the next message pays to write the whole conversation to the cache again. When that costs at least $0.25 more than reading it would have, a warning under the input shows the cost, so you can run `/compact` first to shrink the context.
+
 ## Skills
 
 Besides the default locations, viper loads skills from the directories in `skillPaths`. `enableSkills: false` (or `--no-skills`) turns skills off. A skill with `disable-model-invocation: true` in its frontmatter is hidden from the model and only runs through `/skill:name`.

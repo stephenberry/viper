@@ -82,7 +82,7 @@ pub enum Entry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageKind {
-    /// A request that kept the prompt cache from expiring (see `crate::cache_warming`).
+    /// A request that kept the prompt cache from expiring (see `crate::prompt_cache`).
     CacheWarm,
 }
 

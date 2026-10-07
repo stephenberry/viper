@@ -1,6 +1,5 @@
 mod agent;
 mod auth;
-mod cache_warming;
 mod cli;
 mod compaction;
 mod config;
@@ -9,6 +8,7 @@ mod images;
 mod message;
 mod model_sync;
 mod modes;
+mod prompt_cache;
 mod provider;
 mod session;
 #[cfg(test)]
