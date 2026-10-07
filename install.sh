@@ -4,8 +4,10 @@
 #   curl -fsSL https://raw.githubusercontent.com/stephenberry/viper/main/install.sh | sh
 #
 # Environment:
-#   VIPER_VERSION      release to install, e.g. v0.1.1 (default: the latest)
-#   VIPER_INSTALL_DIR  where to put the binary (default: ~/.local/bin)
+#   VIPER_VERSION         release to install, e.g. v0.1.1 (default: the latest)
+#   VIPER_INSTALL_DIR     where to put the binary (default: ~/.local/bin)
+#   VIPER_NO_MODIFY_PATH  if set, print the line that adds the binary to PATH instead of
+#                         appending it to your shell's startup file
 
 set -eu
 
@@ -100,18 +102,66 @@ main() {
 
     case ":$PATH:" in
         *":$install_dir:"*) ;;
-        *)
-            case "${SHELL:-}" in
-                */zsh) rc="$HOME/.zshrc" ;;
-                */bash) rc="$HOME/.bashrc" ;;
-                *) rc="your shell's startup file" ;;
-            esac
-            say ""
-            say "$install_dir is not on your PATH. Add this line to $rc, then open a new shell:"
-            say ""
-            say "  export PATH=\"$install_dir:\$PATH\""
-            ;;
+        *) add_to_path "$install_dir" ;;
     esac
+}
+
+# The startup file of the user's login shell, or nothing if the shell is unknown.
+shell_rc() {
+    case "${SHELL:-}" in
+        */zsh) echo "${ZDOTDIR:-$HOME}/.zshrc" ;;
+        # macOS terminals start bash as a login shell, which reads .bash_profile, not .bashrc.
+        */bash) if [ "$(uname -s)" = Darwin ]; then echo "$HOME/.bash_profile"; else echo "$HOME/.bashrc"; fi ;;
+        */fish) echo "${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish" ;;
+    esac
+}
+
+# Adds a directory to PATH in the user's shell startup file, unless VIPER_NO_MODIFY_PATH is set.
+# Falls back to printing the line to add when the file can't be determined or written.
+add_to_path() {
+    dir=$1
+    rc=$(shell_rc)
+    case "$rc" in
+        */config.fish) line="fish_add_path \"$dir\"" ;;
+        *) line="export PATH=\"$dir:\$PATH\"" ;;
+    esac
+
+    # Characters that would break out of the double-quoted line are left for the user to handle.
+    # shellcheck disable=SC2016 # the $ and ` are literal characters to match
+    if [ -n "${VIPER_NO_MODIFY_PATH:-}" ] || [ -z "$rc" ] || printf '%s' "$dir" | grep -q '["$`\\]'; then
+        target=${rc:-"your shell's startup file"}
+        say ""
+        say "$dir is not on your PATH. Add this line to $target, then open a new shell:"
+        say ""
+        say "  $line"
+        return
+    fi
+
+    if [ -f "$rc" ] && grep -qxF "$line" "$rc"; then
+        say ""
+        say "$rc already adds $dir to your PATH; open a new shell to use viper."
+        return
+    fi
+
+    if ! mkdir -p "$(dirname "$rc")" 2>/dev/null || ! {
+        # Separate from existing content by a blank line, even if the file lacks a final newline.
+        if [ -s "$rc" ]; then
+            [ -z "$(tail -c 1 "$rc")" ] || printf '\n'
+            printf '\n'
+        fi
+        printf '# Added by the viper installer\n%s\n' "$line"
+    } 2>/dev/null >>"$rc"; then
+        say ""
+        say "Could not update $rc. Add this line to it, then open a new shell:"
+        say ""
+        say "  $line"
+        return
+    fi
+
+    say ""
+    say "Added $dir to your PATH in $rc. Open a new shell, or run this to use viper now:"
+    say ""
+    say "  $line"
 }
 
 main "$@"

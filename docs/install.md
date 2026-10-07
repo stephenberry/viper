@@ -18,7 +18,7 @@ The installer downloads the latest release for your platform, checks it against 
 
 | Platform | Location |
 |---|---|
-| Linux, macOS | `~/.local/bin/viper`. If that directory is not on your `PATH`, the installer prints the line to add. |
+| Linux, macOS | `~/.local/bin/viper`. If that directory is not on your `PATH`, the installer adds it in your shell's startup file (`~/.bashrc`, `~/.zshrc`, or fish's `config.fish`; `~/.bash_profile` for bash on macOS). |
 | Windows | `%LOCALAPPDATA%\Programs\viper\viper.exe`, which is added to your user `PATH` |
 
 Run the same command again to update; your configuration in `~/.viper` is kept. To change what is installed, set these first:
@@ -27,6 +27,7 @@ Run the same command again to update; your configuration in `~/.viper` is kept. 
 |---|---|
 | `VIPER_VERSION` | Release to install, such as `v0.1.1` (default: the latest) |
 | `VIPER_INSTALL_DIR` | Directory for the binary |
+| `VIPER_NO_MODIFY_PATH` | If set, print the line that adds the binary to `PATH` instead of editing your startup file |
 
 For example, `curl -fsSL https://raw.githubusercontent.com/stephenberry/viper/main/install.sh | VIPER_VERSION=v0.1.1 sh`.
 
