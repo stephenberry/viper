@@ -23,7 +23,20 @@ function Install-Viper {
 
     $version = $env:VIPER_VERSION
     if (-not $version) {
-        $version = (Invoke-RestMethod "https://api.github.com/repos/$repo/releases/latest").tag_name
+        # The tag of the latest release, read from where /releases/latest redirects. Unlike the
+        # GitHub API, this is not rate limited per IP address.
+        $request = [Net.WebRequest]::Create("https://github.com/$repo/releases/latest")
+        $request.Method = 'HEAD'
+        $response = $request.GetResponse()
+        try {
+            $version = $response.ResponseUri.Segments[-1]
+        }
+        finally {
+            $response.Close()
+        }
+        if (-not $version.StartsWith('v')) {
+            throw "no viper release found at https://github.com/$repo/releases"
+        }
     }
     if (-not $version.StartsWith('v')) {
         $version = "v$version"
