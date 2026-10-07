@@ -1,0 +1,3 @@
+# cross builds the Linux release binaries in a container; pass through what the build reads.
+[build.env]
+passthrough = ["VIPER_RELEASE_TARGET"]

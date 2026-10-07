@@ -91,7 +91,8 @@ Models are identified as `provider/id`. To list the same gateway model twice (fo
   "skillPaths": [],
   "enableSkills": true,
   "hideThinking": false,
-  "toolOutputLines": 10
+  "toolOutputLines": 10,
+  "autoUpdate": true
 }
 ```
 
@@ -100,6 +101,8 @@ Picking a model or thinking level in the interactive UI (`/model`, `/thinking`, 
 `modelSettings` holds per-model settings keyed by `provider/model-id`; `/autocompact` writes `autoCompactWindow` there.
 
 `retry` covers transient API failures (rate limits, overload, server errors, dropped connections), which are retried with exponential backoff as long as no output has streamed yet.
+
+`autoUpdate: false` stops viper from installing new releases itself; it then only says when one is available (see [Updating](install.md#updating)).
 
 ## Skills
 

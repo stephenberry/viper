@@ -30,7 +30,7 @@ On Windows, in PowerShell:
 irm https://raw.githubusercontent.com/stephenberry/viper/main/install.ps1 | iex
 ```
 
-Run the same command again to update. See [docs/install.md](docs/install.md) for installing a specific version, manual downloads, and building from source.
+viper keeps itself up to date: it installs new releases in the background, and the next start runs them. See [docs/install.md](docs/install.md) for installing a specific version, manual downloads, and building from source.
 
 ## Quick start
 

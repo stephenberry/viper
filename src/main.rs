@@ -15,6 +15,7 @@ mod testing;
 mod time;
 mod tools;
 mod tui;
+mod update;
 mod util;
 
 use std::io::{IsTerminal, Read};

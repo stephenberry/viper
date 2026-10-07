@@ -299,6 +299,8 @@ pub struct Settings {
     pub tool_output_lines: usize,
     /// Per-model settings keyed by `provider/model-id`.
     pub model_settings: BTreeMap<String, ModelSettings>,
+    /// Interactive mode: install newer releases in the background (release builds only).
+    pub auto_update: bool,
 }
 
 impl Default for Settings {
@@ -316,6 +318,7 @@ impl Default for Settings {
             hide_thinking: false,
             tool_output_lines: 10,
             model_settings: BTreeMap::new(),
+            auto_update: true,
         }
     }
 }

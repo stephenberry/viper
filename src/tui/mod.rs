@@ -80,6 +80,7 @@ enum AppMsg {
     BashDone(Result<BashExecutionMessage>),
     LoginChecked(Box<CheckedLogin>),
     ModelsSynced(String, Result<SyncReport>),
+    Update(crate::update::Outcome),
 }
 
 enum StreamKind {
@@ -756,6 +757,11 @@ impl App {
                 }
                 self.refresh_footer();
             }
+            AppMsg::Update(outcome) => match crate::update::describe(&outcome) {
+                Some((text, true)) => self.warning(&text),
+                Some((text, false)) => self.notice(&text),
+                None => {}
+            },
         }
     }
 
@@ -1567,6 +1573,25 @@ fn session_item(summary: &crate::session::SessionSummary) -> Item {
     }
 }
 
+/// How often a long-running session checks for a newer release.
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Check for a newer release now and then periodically, reporting the first news. A check that
+/// cannot reach GitHub is retried at the next interval.
+fn spawn_update_checks(client: reqwest::Client, install: bool, tx: mpsc::UnboundedSender<AppMsg>) {
+    tokio::spawn(async move {
+        loop {
+            if let Ok(outcome) = crate::update::check(&client, install).await
+                && !matches!(outcome, crate::update::Outcome::UpToDate)
+            {
+                let _ = tx.send(AppMsg::Update(outcome));
+                return;
+            }
+            tokio::time::sleep(UPDATE_CHECK_INTERVAL).await;
+        }
+    });
+}
+
 /// Run the interactive UI until the user exits.
 pub async fn run(
     agent: Agent,
@@ -1576,6 +1601,11 @@ pub async fn run(
 ) -> Result<ExitCode> {
     let guard = TerminalGuard::enter().context("could not set up the terminal")?;
     let (app_tx, mut app_rx) = mpsc::unbounded_channel();
+    if crate::update::enabled() {
+        crate::update::remove_old_exe();
+        let install = agent.setup().settings.auto_update;
+        spawn_update_checks(agent.http_client().clone(), install, app_tx.clone());
+    }
     let mut app = App::new(agent.clone(), guard, app_tx);
     app.welcome(&warnings);
     let history = agent.session_messages();

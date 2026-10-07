@@ -21,7 +21,7 @@ The installer downloads the latest release for your platform, checks it against 
 | Linux, macOS | `~/.local/bin/viper`. If that directory is not on your `PATH`, the installer adds it in your shell's startup file (`~/.bashrc`, `~/.zshrc`, or fish's `config.fish`; `~/.bash_profile` for bash on macOS). |
 | Windows | `%LOCALAPPDATA%\Programs\viper\viper.exe`, which is added to your user `PATH` |
 
-Run the same command again to update; your configuration in `~/.viper` is kept. To change what is installed, set these first:
+viper then keeps itself up to date (see [Updating](#updating)). Running the command again also updates it; your configuration in `~/.viper` is kept. To change what is installed, set these first:
 
 | Variable | Effect |
 |---|---|
@@ -32,6 +32,12 @@ Run the same command again to update; your configuration in `~/.viper` is kept. 
 For example, `curl -fsSL https://raw.githubusercontent.com/stephenberry/viper/main/install.sh | VIPER_VERSION=v0.1.1 sh`.
 
 On Windows, viper runs tools through bash, so also install [Git for Windows](https://git-scm.com/download/win), which provides it. viper finds its bash automatically.
+
+## Updating
+
+Release builds of interactive viper check for a new release at startup and every six hours. A new release is downloaded, checked against its `SHA256SUMS`, and installed over the running binary; viper then says "restart viper to use it". The running session is unaffected.
+
+To only be told about new releases, set `"autoUpdate": false` in `~/.viper/settings.json`. viper can only update itself when it can write to the directory it is installed in; otherwise it says how to update. Builds from source never update themselves.
 
 ## Manual install
 

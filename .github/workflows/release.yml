@@ -67,6 +67,9 @@ jobs:
         with:
           tool: cross
       - name: Build
+        env:
+          # Marks the binary as an official release that can update itself (see src/update.rs).
+          VIPER_RELEASE_TARGET: ${{ matrix.name }}
         run: |
           for target in ${{ join(matrix.targets, ' ') }}; do
             if [ "$RUNNER_OS" = Linux ]; then
@@ -95,11 +98,13 @@ jobs:
               tar czf "$name.tar.gz" "$name"
               ;;
           esac
+          # The binary alone, which viper downloads to update itself.
+          gzip -9 -c "$name"/viper* > "$name.gz"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
           path: |
-            viper-*.tar.gz
+            viper-*.gz
             viper-*.zip
           if-no-files-found: error
 
