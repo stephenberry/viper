@@ -29,6 +29,11 @@ impl Editor {
         &self.text
     }
 
+    /// Byte offset of the cursor in the text.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()
     }
