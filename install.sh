@@ -143,14 +143,14 @@ add_to_path() {
         return
     fi
 
-    if ! mkdir -p "$(dirname "$rc")" 2>/dev/null || ! {
-        # Separate from existing content by a blank line, even if the file lacks a final newline.
-        if [ -s "$rc" ]; then
-            [ -z "$(tail -c 1 "$rc")" ] || printf '\n'
-            printf '\n'
-        fi
-        printf '# Added by the viper installer\n%s\n' "$line"
-    } 2>/dev/null >>"$rc"; then
+    # Separate from existing content by a blank line, even if the file lacks a final newline.
+    separator=
+    if [ -s "$rc" ]; then
+        separator='\n'
+        [ -z "$(tail -c 1 "$rc")" ] || separator='\n\n'
+    fi
+    if ! mkdir -p "$(dirname "$rc")" 2>/dev/null ||
+        ! printf '%b# Added by the viper installer\n%s\n' "$separator" "$line" 2>/dev/null >>"$rc"; then
         say ""
         say "Could not update $rc. Add this line to it, then open a new shell:"
         say ""
