@@ -32,7 +32,7 @@ Or start `viper` without a key and run `/login anthropic`. To use a LiteLLM gate
 The default model is Claude Opus 5.5 with `high` thinking. `viper --list-models` shows every configured model.
 
 > [!WARNING]
-> viper does not ask before running tools, including `bash`. Use it in a sandbox for untrusted work.
+> viper does not ask before running tools, including `bash`.
 
 ## Usage
 
