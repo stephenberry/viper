@@ -72,7 +72,7 @@ cargo install --path .
 
 ## Setting up a model provider
 
-viper keeps its configuration in `~/.viper` (see [Configuration](../README.md#configuration)).
+viper keeps its configuration in `~/.viper` (see [Configuration](configuration.md)).
 
 **Anthropic:** set `ANTHROPIC_API_KEY`, or run `viper` and then `/login anthropic`.
 

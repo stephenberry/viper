@@ -1,10 +1,17 @@
 # viper
 
-A minimal coding agent for the terminal, written in Rust. viper is modeled on [pi](https://github.com/earendil-works/pi) but keeps only the essentials: Anthropic models (directly or through a LiteLLM gateway), seven built-in tools, sessions, compaction, `AGENTS.md`, and skills.
+A minimal coding agent for the terminal, written in Rust.
+
+viper is modeled on [pi](https://github.com/earendil-works/pi) but keeps only the essentials:
+
+- Anthropic models, directly or through a LiteLLM gateway
+- Seven built-in tools: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`
+- Saved sessions with automatic compaction
+- `AGENTS.md` instructions and skills
 
 ## Install
 
-Each [GitHub release](https://github.com/stephenberry/viper/releases) has prebuilt binaries: static Linux builds (x86_64 and arm64), a universal macOS build, and Windows (x86_64), with SHA-256 checksums in `SHA256SUMS`. See [docs/install.md](docs/install.md) for step-by-step instructions for each platform and for setting up a model provider.
+Prebuilt binaries for Linux, macOS, and Windows are on the [releases page](https://github.com/stephenberry/viper/releases). See [docs/install.md](docs/install.md) for step-by-step instructions.
 
 To build from source (Rust 1.96 or newer):
 
@@ -20,144 +27,63 @@ cd your/project
 viper
 ```
 
-The default model is Claude Opus 5.5 at the `high` thinking level. `viper --list-models` shows every configured model.
+Or start `viper` without a key and run `/login anthropic`. To use a LiteLLM gateway, see [Setting up a model provider](docs/install.md#setting-up-a-model-provider).
 
-## Modes
+The default model is Claude Opus 5.5 with `high` thinking. `viper --list-models` shows every configured model.
+
+> [!WARNING]
+> viper does not ask before running tools, including `bash`. Use it in a sandbox for untrusted work.
+
+## Usage
 
 | Command | What it does |
 |---|---|
-| `viper [message]` | Interactive terminal UI |
-| `viper -p "prompt"` | Run the prompt, print the final response, exit |
-| `viper --mode json "prompt"` | Run the prompt and stream agent events as JSON lines ([events](docs/rpc.md#events)) |
-| `viper --mode rpc` | JSON-lines command protocol on stdin/stdout ([docs/rpc.md](docs/rpc.md)) |
+| `viper` | Start the interactive UI |
+| `viper -c` | Continue the latest session in this directory |
+| `viper -r` | Pick a session to resume |
+| `viper -p "prompt"` | Print the final response and exit |
+| `viper --mode json "prompt"` | Stream agent events as JSON lines |
+| `viper --mode rpc` | Drive viper over stdin/stdout ([protocol](docs/rpc.md)) |
 
-Arguments starting with `@` attach files (`viper @src/main.rs "explain this"`); images are sent as images. In print and JSON modes, piped stdin is prepended to the prompt.
+Attach files with `@`, for example `viper @src/main.rs "explain this"`. In print and JSON modes, piped stdin is added to the prompt. Run `viper --help` for all options.
 
-Common options: `-m/--model <provider/id>`, `--thinking <level>`, `-c/--continue`, `-r/--resume`, `--session <file>`, `--no-session`, `--tools read,bash,...`, `--no-tools`, `--no-skills`, `--system-prompt`, `--append-system-prompt`, `--api-key`, `--cwd`, `--list-models`, `--sync-models <provider>`. See `viper --help`.
+### Interactive UI
 
-## Interactive use
+Output goes to your terminal's normal scrollback, so scrolling and copying work as usual.
 
-Output flows into your terminal's normal scrollback, so scrolling, selection, and copying work as usual. Only the editor and status lines at the bottom are redrawn.
+| Key | Action |
+|---|---|
+| Enter | Send. While the agent works, steer it instead |
+| Alt+Enter | Queue a follow-up for when the agent finishes |
+| Esc | Interrupt |
+| Shift+Enter or Ctrl+J | New line |
+| Shift+Tab | Cycle the thinking level |
+| Ctrl+L | Pick a model |
+| Ctrl+G | Edit the message in `$VISUAL` or `$EDITOR` |
+| Ctrl+V | Paste an image (or drag an image file in) |
 
-- **Enter** sends. While the agent works, Enter steers it (the message is injected after the current tool calls) and **Alt+Enter** queues a follow-up for when it finishes.
-- **Esc** interrupts; queued messages return to the editor.
-- **Shift+Enter**, **Ctrl+J**, or `\` then Enter inserts a newline.
-- **Shift+Tab** cycles the thinking level, **Ctrl+L** picks a model (only models with credentials are listed), **Ctrl+G** opens `$VISUAL`/`$EDITOR`, **Ctrl+V** pastes a clipboard image. Dragging an image file into the terminal attaches it.
-- `!command` runs a shell command and adds its output to the conversation; `!!command` keeps it out of the model's context.
-- `/help` lists commands: `/model`, `/thinking`, `/new`, `/resume`, `/session`, `/name`, `/compact`, `/autocompact`, `/login`, `/sync-models`, `/copy`, `/hotkeys`, `/quit`, and `/skill:<name>`.
+Type `!command` to run a shell command and share its output with the model, or `!!command` to run it without sharing. Type `/help` for slash commands such as `/model`, `/resume`, `/compact`, and `/login`.
 
-## Tools
+## Instructions and skills
 
-`read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls`. Tool calls in one response run in order; consecutive read-only calls (`read`, `grep`, `find`, `ls`) run concurrently. `read` and `bash` output is truncated to 2000 lines or 50KB (`bash` keeps the end, and saves the full output to a temp file whose path is given to the model). `grep`, `find`, and `ls` stop at 100 matches, 1000 results, and 500 entries respectively (the model can raise this with `limit`), or 50KB. `grep` and `find` are built in (no ripgrep or fd needed) and respect `.gitignore`.
+viper adds `AGENTS.md` files to the system prompt: the global one in `~/.viper`, then one from each directory between the filesystem root and the working directory. `AGENTS.override.md` takes precedence over `AGENTS.md`, and `CLAUDE.md` is used when neither exists.
 
-viper does not ask before running tools. Use it in a sandbox for untrusted work.
+Skills use the [Agent Skills](https://agentskills.io/specification) format. The model sees each skill's name and description and reads the full skill when a task calls for it; `/skill:name` loads one explicitly. viper finds skills in `.viper/skills` and `.agents/skills` from the working directory up to the repository root, and in `~/.viper/skills` and `~/.agents/skills`.
+
+## Sessions
+
+Sessions are saved in `~/.viper/sessions/`. When the context nears the model's limit, viper summarizes older messages and keeps recent ones verbatim; the full history stays in the session file. Run `/compact` to do this on demand, or `/autocompact 300k` to compact earlier and keep long sessions cheaper.
 
 ## Configuration
 
-Everything lives in `~/.viper` (override with `VIPER_DIR`):
-
-| Path | Purpose |
-|---|---|
-| `settings.json` | Settings; merged with `<project>/.viper/settings.json` |
-| `models.json` | Providers and models (LiteLLM, base URL overrides); no secrets, safe to share |
-| `auth.json` | API keys saved by `/login`, readable only by you |
-| `AGENTS.md` | Instructions added to every session |
-| `skills/` | User skills |
-| `sessions/` | Saved sessions, grouped by working directory |
-
-### Logging in
-
-`/login <provider>` asks for the provider's base URL and API key, checks the key by listing the server's models, and saves it: the key to `auth.json` (mode 0600) and the URL to `models.json`. A key the server rejects is not saved. Logging in removes a plaintext `apiKey` from that provider in `models.json`, and the new key takes effect immediately. Without any configured key, the interactive UI still starts so you can run `/login`.
-
-A provider's key is taken from, in order: `--api-key`, `auth.json`, `apiKey` in `models.json`, then (for the built-in `anthropic` provider) `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`.
-
-### Anthropic
-
-The built-in `anthropic` provider reads `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN`, sent as a bearer token) and honors `ANTHROPIC_BASE_URL`. To change its URL or key in configuration:
-
-```json
-{
-  "providers": {
-    "anthropic": { "baseUrl": "https://api.anthropic.com", "apiKey": "$MY_ANTHROPIC_KEY" }
-  }
-}
-```
-
-Without a `models` list, only `baseUrl`, `apiKey`, `authHeader`, and `headers` apply to the built-in Anthropic models. A `models` list under `anthropic` replaces the built-in models with the listed ones.
-
-### LiteLLM
-
-Run `/login litellm` (or add `baseUrl` yourself), then run `/sync-models litellm` (or `viper --sync-models litellm`) to add the gateway's models to `models.json`, or list them yourself. Each model talks to the gateway through either its Anthropic-compatible endpoint (`/v1/messages`) or its OpenAI-compatible endpoint (`/v1/chat/completions`), chosen per model with `api`:
-
-```json
-{
-  "providers": {
-    "litellm": {
-      "baseUrl": "http://localhost:4000",
-      "api": "openai-completions",
-      "models": [
-        { "id": "claude-opus-5-5", "api": "anthropic-messages" },
-        { "id": "claude-opus-5-5", "alias": "claude-opus-5-5-openai", "name": "Claude Opus 5.5 (OpenAI API)" },
-        { "id": "claude-sonnet", "base": "claude-sonnet-5-5", "api": "anthropic-messages" },
-        { "id": "gpt-5", "contextWindow": 400000, "reasoning": "effort", "thinkingLevels": ["low", "medium", "high"] }
-      ]
-    }
-  }
-}
-```
-
-Model ids that name a built-in Claude model inherit its context window, output limit, thinking support, image support, and prices. The id can match exactly, after the last `/` (`anthropic/claude-opus-5-5`), or after the last `.` (Bedrock's `us.anthropic.claude-opus-5-5`). Use `base` to inherit from a built-in model under a different alias. Fields you set override inherited ones, which matters when a gateway prices or limits a model differently.
-
-viper identifies models as `provider/id`. To list the same gateway model twice (for example through both endpoints), give one an `alias`: viper selects it as `provider/alias` and still sends `id` to the gateway.
-
-Provider fields: `baseUrl`, `apiKey`, `api` (`anthropic-messages` or `openai-completions`), `authHeader` (`bearer`, the default for custom providers, or `xapikey`), `headers`.
-
-Model fields: `id`, `alias`, `name`, `base`, `api`, `contextWindow`, `maxTokens`, `reasoning` (`adaptive`, `budget`, `effort`, `none`), `thinkingLevels`, `images`, `cost` (`input`, `output`, `cacheRead`, `cacheWrite` in dollars per million tokens), `cacheControl`, `eagerInputStreaming`, `headers`, and `extraBody` (fields merged into every request body).
-
-`/sync-models <provider>` lists the server's models (`GET /v1/models`) and adds the ones `models.json` does not have yet. With LiteLLM, each new entry also gets the context window, output limit, prices, and image and reasoning support that the gateway reports. Models named after a built-in Claude model keep the provider's `api` and inherit the rest; other models use `openai-completions`. Existing entries are never changed, and configured models the server no longer lists are only reported.
-
-`apiKey` and header values accept `$VAR` or `${VAR}`, `!command` (the command's output, run per request), or a literal.
-
-### Settings
-
-```json
-{
-  "defaultModel": "anthropic/claude-opus-5-5",
-  "defaultThinkingLevel": "high",
-  "tools": ["read", "bash", "edit", "write", "grep", "find", "ls"],
-  "compaction": { "enabled": true, "reserveTokens": 16384, "keepRecentTokens": 20000, "autoCompactWindow": null },
-  "retry": { "enabled": true, "maxRetries": 3, "baseDelayMs": 2000 },
-  "shellPath": null,
-  "appendSystemPrompt": null,
-  "skillPaths": [],
-  "enableSkills": true,
-  "hideThinking": false,
-  "toolOutputLines": 10
-}
-```
-
-Choosing a model or thinking level in the interactive UI (`/model`, `/thinking`, **Ctrl+L**, **Shift+Tab**) also saves it as `defaultModel` or `defaultThinkingLevel`. Resuming a session and RPC commands do not change the defaults.
-
-`modelSettings` holds per-model settings keyed by `provider/model-id`; `/autocompact` writes `autoCompactWindow` there.
-
-## Context and skills
-
-viper adds instruction files to the system prompt: the global one in `~/.viper`, then one from each directory between the filesystem root and the working directory. In each directory, the first of `AGENTS.override.md`, `AGENTS.md`, and `CLAUDE.md` is used.
-
-Skills follow the [Agent Skills](https://agentskills.io/specification) format: a directory containing `SKILL.md` with `name` and `description` frontmatter. viper lists each skill's name and description in the system prompt and the model reads the file when a task matches. `/skill:name args` loads a skill explicitly; `disable-model-invocation: true` hides a skill from the model. Skills are discovered in `.viper/skills` and `.agents/skills` from the working directory up to the repository root, `skillPaths`, `~/.viper/skills`, and `~/.agents/skills`.
-
-## Sessions and compaction
-
-Sessions are saved as JSONL in `~/.viper/sessions/` once the first message is sent. `viper -c` continues the latest session for the directory, `viper -r` and `/resume` pick one, and `/name` labels the current one. Resuming restores the session's model and thinking level.
-
-When the context approaches the model's window (within `reserveTokens`), viper summarizes older messages into a structured checkpoint and keeps roughly the last `keepRecentTokens` verbatim. When the kept messages begin partway through a long turn, the start of that turn (your request and the work so far) gets its own summary, so the request is not lost among older history. `/compact [focus]` compacts on demand.
-
-`/autocompact` changes when auto-compaction runs, as in Claude Code. `/autocompact 300k` compacts the current model's context at 300k tokens instead of near its full window, which keeps long sessions with large-window models cheaper. Sizes from 100k to 1M are accepted (`300k`, `1M`, or `300` for thousands), capped by the model's window. `/autocompact auto` returns to the default, `off` and `on` toggle auto-compaction for all models, and `/autocompact` alone shows the current setting. Sizes and `auto` are saved per model in `~/.viper/settings.json` (`modelSettings`); `off` and `on` set `compaction.enabled`, and setting a size turns auto-compaction back on. `compaction.autoCompactWindow` sets a default for models without their own size. The footer shows `compact at <size>` when a window is set. If a request overflows the context anyway, viper compacts and retries once. The full history stays in the session file.
-
-Transient API failures (rate limits, overload, server errors, dropped connections) are retried with exponential backoff before any output has streamed.
+Settings, providers, and API keys live in `~/.viper`. See [docs/configuration.md](docs/configuration.md) for LiteLLM models, settings, and compaction options.
 
 ## Development
 
-`cargo test` runs the test suite; CI also checks `cargo fmt` and `cargo clippy`. Pushes and pull requests are tested on Linux; run the CI workflow manually to also test on macOS, Windows, or both.
+`cargo test` runs the tests; CI also checks `cargo fmt` and `cargo clippy`. Pushes and pull requests are tested on Linux; run the CI workflow manually to also test macOS or Windows.
 
-To release, set `version` in `Cargo.toml`, commit, and push a matching tag (`git tag v0.2.0 && git push origin v0.2.0`). The release workflow builds the binaries and publishes the release.
+To release, set `version` in `Cargo.toml`, commit, and push a matching tag (`git tag v0.2.0 && git push origin v0.2.0`).
+
+## License
+
+[MIT](LICENSE)
