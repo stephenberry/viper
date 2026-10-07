@@ -297,6 +297,7 @@ mod tests {
     }
 
     /// Serve `routes` (path, status, `location` header, body) over HTTP, one connection per request.
+    #[cfg(unix)]
     async fn serve(routes: Vec<(String, u16, Option<&'static str>, Vec<u8>)>) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
