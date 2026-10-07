@@ -514,6 +514,9 @@ pub struct Model {
     pub eager_input_streaming: bool,
     /// Send prompt-caching breakpoints.
     pub cache_control: bool,
+    /// Where the provider reports the key's spend and budget (`budgetUrl`, see `crate::budget`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_url: Option<String>,
 }
 
 impl Model {
@@ -540,6 +543,7 @@ impl Model {
             cost: ModelCost::default(),
             eager_input_streaming: false,
             cache_control: false,
+            budget_url: None,
         }
     }
 
@@ -659,6 +663,7 @@ struct ProviderConfig {
     auth_header: Option<AuthHeader>,
     #[serde(default)]
     headers: BTreeMap<String, String>,
+    budget_url: Option<String>,
     #[serde(default)]
     models: Vec<ModelConfig>,
 }
@@ -854,6 +859,7 @@ pub(crate) fn builtin_anthropic_models() -> Vec<Model> {
             cost: b.cost,
             eager_input_streaming: true,
             cache_control: true,
+            budget_url: None,
         })
         .collect()
 }
@@ -879,6 +885,7 @@ fn provider_connection(provider_name: &str, provider: &ProviderConfig) -> Option
         api_key: provider.api_key.as_deref().map(ConfigValue::parse),
         auth_header: provider.auth_header.unwrap_or(AuthHeader::Bearer),
         headers: provider.headers.iter().map(|(k, v)| (k.clone(), ConfigValue::parse(v))).collect(),
+        budget_url: provider.budget_url.clone(),
         ..Model::connection(provider_name, base_url)
     })
 }
@@ -948,6 +955,7 @@ fn resolve_custom_model(provider_name: &str, provider: &ProviderConfig, config: 
         // Proxies may reject the field; opt in per model.
         eager_input_streaming: config.eager_input_streaming.unwrap_or(false),
         cache_control: config.cache_control.unwrap_or(inherited.is_some()),
+        budget_url: provider.budget_url.clone(),
     })
 }
 
@@ -988,6 +996,9 @@ impl ModelRegistry {
                             model.auth_header = auth;
                         }
                         model.headers.extend(provider.headers.iter().map(|(k, v)| (k.clone(), ConfigValue::parse(v))));
+                        if provider.budget_url.is_some() {
+                            model.budget_url.clone_from(&provider.budget_url);
+                        }
                     }
                     continue;
                 }

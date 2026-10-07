@@ -36,7 +36,7 @@ The built-in `anthropic` provider reads `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_
 }
 ```
 
-Without a `models` list, only `baseUrl`, `apiKey`, `authHeader`, and `headers` apply. Adding a `models` list under `anthropic` replaces the built-in models with the ones listed.
+Without a `models` list, only `baseUrl`, `apiKey`, `authHeader`, `headers`, and `budgetUrl` apply. Adding a `models` list under `anthropic` replaces the built-in models with the ones listed.
 
 ## LiteLLM and other providers
 
@@ -71,9 +71,23 @@ Models are identified as `provider/id`. To list the same gateway model twice (fo
 
 ### Fields
 
-**Provider:** `baseUrl`, `apiKey`, `api` (`anthropic-messages` or `openai-completions`), `authHeader` (`bearer`, the default for custom providers, or `xapikey`), `headers`.
+**Provider:** `baseUrl`, `apiKey`, `api` (`anthropic-messages` or `openai-completions`), `authHeader` (`bearer`, the default for custom providers, or `xapikey`), `headers`, `budgetUrl` (see [Budgets](#budgets)).
 
 **Model:** `id`, `alias`, `name`, `base`, `api`, `contextWindow`, `maxTokens`, `reasoning` (`adaptive`, `budget`, `effort`, `none`), `thinkingLevels`, `images`, `cost` (`input`, `output`, `cacheRead`, `cacheWrite` in dollars per million tokens), `cacheControl`, `eagerInputStreaming`, `headers`, and `extraBody` (fields merged into every request body).
+
+## Budgets
+
+If your gateway caps how much a key may spend, set `budgetUrl` on its provider to the endpoint that reports it, and `/budget` shows what you have spent and have left. A full URL is used as is; a path such as `/key/info` is on the host of `baseUrl`. viper calls it with the provider's API key and reads LiteLLM's field names (`spend`, `max_budget`, `budget_duration`, `budget_reset_at`, and `remaining` if present), at the top level or under `info` as in LiteLLM's `/key/info`:
+
+```json
+{
+  "providers": {
+    "litellm": { "baseUrl": "https://litellm.example.com", "budgetUrl": "/key/info", "models": [] }
+  }
+}
+```
+
+`/budget` checks the current model's provider; `/budget <provider>` checks another.
 
 ## Settings
 

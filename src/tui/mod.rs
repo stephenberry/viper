@@ -44,6 +44,7 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("new", "Start a new session", false),
     ("resume", "Resume a saved session", false),
     ("session", "Show session information", false),
+    ("budget", "Show a provider's spend and remaining budget: /budget [provider]", false),
     ("name", "Name the session: /name <name>", true),
     ("compact", "Compact the context: /compact [focus]", false),
     ("autocompact", "Set when auto-compaction runs: /autocompact <size>|auto|off|on", false),
@@ -80,6 +81,7 @@ enum AppMsg {
     BashDone(Result<BashExecutionMessage>),
     LoginChecked(Box<CheckedLogin>),
     ModelsSynced(String, Result<SyncReport>),
+    Budget(String, Result<crate::budget::Budget>),
     Update(crate::update::Outcome),
 }
 
@@ -222,6 +224,18 @@ fn format_tokens(n: u64) -> String {
         1_000..1_000_000 => scaled(n as f64 / 1_000.0, "k"),
         _ => scaled(n as f64 / 1_000_000.0, "M"),
     }
+}
+
+/// Input and output prices per million tokens, e.g. `$4 in · $20 out /1M`; `None` when unknown.
+fn format_prices(cost: &crate::config::ModelCost) -> Option<String> {
+    if cost.input <= 0.0 && cost.output <= 0.0 {
+        return None;
+    }
+    let dollars = |price: f64| {
+        let text = format!("{price:.2}");
+        format!("${}", text.trim_end_matches('0').trim_end_matches('.'))
+    };
+    Some(format!("{} in · {} out /1M", dollars(cost.input), dollars(cost.output)))
 }
 
 /// The warning under the input while the prompt cache has expired.
@@ -789,6 +803,13 @@ impl App {
                 }
                 self.refresh_footer();
             }
+            AppMsg::Budget(provider, result) => {
+                self.notice = None;
+                match result {
+                    Ok(budget) => self.show_budget(&provider, &budget),
+                    Err(err) => self.error(&format!("Could not get {provider}'s budget: {err:#}")),
+                }
+            }
             AppMsg::Update(outcome) => match crate::update::describe(&outcome) {
                 Some((text, true)) => self.warning(&text),
                 Some((text, false)) => self.notice(&text),
@@ -1188,6 +1209,7 @@ impl App {
             "autocompact" => self.autocompact(args)?,
             "login" => self.start_login(args),
             "sync-models" => self.sync_models(args)?,
+            "budget" => self.check_budget(args)?,
             "copy" => match self.agent.last_assistant_text() {
                 Some(text) => match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
                     Ok(()) => self.notice = Some("Copied the last response.".into()),
@@ -1256,6 +1278,53 @@ impl App {
         }
         self.refresh_footer();
         Ok(())
+    }
+
+    /// `/budget [provider]`: ask the provider (by default the current model's) for its budget.
+    fn check_budget(&mut self, args: &str) -> Result<()> {
+        let registry = self.agent.registry();
+        let provider = match args.trim() {
+            "" => self.agent.model().provider,
+            name => name.to_string(),
+        };
+        let model = registry.provider_model(&provider).cloned().ok_or_else(|| {
+            anyhow::anyhow!("Unknown provider '{provider}' (configured: {})", registry.providers().join(", "))
+        })?;
+        if model.budget_url.is_none() {
+            bail!("{provider} has no budget endpoint; set \"budgetUrl\" for it in models.json");
+        }
+        self.notice = Some(format!("Checking {provider}'s budget…"));
+        let (client, tx) = (self.agent.http_client().clone(), self.app_tx.clone());
+        tokio::spawn(async move {
+            let result = crate::budget::fetch(&client, &model).await;
+            let _ = tx.send(AppMsg::Budget(provider, result));
+        });
+        Ok(())
+    }
+
+    fn show_budget(&mut self, provider: &str, budget: &crate::budget::Budget) {
+        let mut rows = vec![("spent", format!("${:.2}", budget.spend))];
+        match budget.max_budget {
+            Some(cap) => {
+                let period = budget.duration.as_deref().map(|d| format!(" per {d}")).unwrap_or_default();
+                rows.push(("cap", format!("${cap:.2}{period}")));
+            }
+            None => rows.push(("cap", "none".into())),
+        }
+        if let Some(remaining) = budget.remaining {
+            let share =
+                budget.max_budget.filter(|cap| *cap > 0.0).map(|cap| format!(" ({:.0}%)", remaining / cap * 100.0));
+            rows.push(("left", format!("${remaining:.2}{}", share.unwrap_or_default())));
+        }
+        if let Some(reset) = &budget.reset_at {
+            rows.push(("resets", reset.clone()));
+        }
+        let mut lines = vec![Line::plain(bold(&format!("Budget ({provider})")))];
+        for (key, value) in rows {
+            lines.push(Line::indented(format!("{GRAY}{key:<9}{RESET}{value}"), "  ", "           "));
+        }
+        self.gap();
+        self.commit(lines);
     }
 
     /// `/sync-models <provider>`: add the models the provider's server offers to models.json.
@@ -1488,19 +1557,23 @@ impl App {
         let available: Vec<&crate::config::Model> = registry.available();
         let models: Vec<crate::config::Model> =
             if available.is_empty() { registry.all().to_vec() } else { available.into_iter().cloned().collect() };
-        // Names in one column, then provider and window; the full id stays searchable.
+        // Names in one column, then provider, window, and prices, aligned; the full id stays
+        // searchable.
         let width = models.iter().map(|m| visible_width(&m.name)).max().unwrap_or(0).min(40);
+        let provider_width = models.iter().map(|m| visible_width(&m.provider)).max().unwrap_or(0);
+        let window = |m: &crate::config::Model| format!("{} ctx", format_tokens(m.context_window));
+        let window_width = models.iter().map(|m| window(m).len()).max().unwrap_or(0);
         let items = models
             .iter()
-            .map(|m| Item {
-                label: format!("{:<width$}", m.name),
-                detail: format!(
-                    "{} · {} ctx{}",
-                    m.provider,
-                    format_tokens(m.context_window),
-                    if has_credentials(m) { "" } else { " · no credentials" }
-                ),
-                keywords: m.key(),
+            .map(|m| {
+                let mut detail = format!("{:<provider_width$} · {:<window_width$}", m.provider, window(m));
+                if let Some(prices) = format_prices(&m.cost) {
+                    detail.push_str(&format!(" · {prices}"));
+                }
+                if !has_credentials(m) {
+                    detail.push_str(" · no credentials");
+                }
+                Item { label: format!("{:<width$}", m.name), detail: detail.trim_end().to_string(), keywords: m.key() }
             })
             .collect();
         let initial = models.iter().position(|m| m.key() == current).unwrap_or(0);
@@ -1765,6 +1838,15 @@ pub async fn pick_session(cwd: &Path) -> Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formats_model_prices() {
+        let cost = |input, output| crate::config::ModelCost { input, output, ..Default::default() };
+        assert_eq!(format_prices(&cost(4.0, 20.0)).as_deref(), Some("$4 in · $20 out /1M"));
+        assert_eq!(format_prices(&cost(0.15, 0.528)).as_deref(), Some("$0.15 in · $0.53 out /1M"));
+        assert_eq!(format_prices(&cost(2.5, 10.0)).as_deref(), Some("$2.5 in · $10 out /1M"));
+        assert_eq!(format_prices(&cost(0.0, 0.0)), None);
+    }
 
     #[test]
     fn describes_an_expired_cache() {

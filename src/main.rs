@@ -1,5 +1,6 @@
 mod agent;
 mod auth;
+mod budget;
 mod cli;
 mod compaction;
 mod config;
