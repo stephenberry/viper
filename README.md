@@ -1,6 +1,13 @@
-# viper
+<h1 align="center">viper</h1>
 
-A minimal coding agent for the terminal, written in Rust.
+<p align="center">A minimal coding agent for the terminal, written in Rust.</p>
+
+<p align="center">
+  <a href="https://github.com/stephenberry/viper/actions/workflows/ci.yml"><img src="https://github.com/stephenberry/viper/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/stephenberry/viper/releases/latest"><img src="https://img.shields.io/github/v/release/stephenberry/viper" alt="Latest release"></a>
+  <img src="https://img.shields.io/badge/rust-1.96%2B-orange" alt="Rust 1.96+">
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/stephenberry/viper" alt="MIT license"></a>
+</p>
 
 viper is modeled on [pi](https://github.com/earendil-works/pi) but keeps only the essentials:
 
