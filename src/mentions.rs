@@ -56,10 +56,12 @@ pub fn attachments(text: &str, cwd: &Path) -> Result<Vec<ContentBlock>> {
     Ok(blocks)
 }
 
-/// The file a mention names, allowing punctuation after it, as at the end of a sentence.
+/// The file a mention names, allowing punctuation after it, as at the end of a sentence. The name
+/// without that punctuation is tried first: Windows ignores trailing dots, so `notes.md.` would
+/// otherwise open `notes.md` under the wrong name.
 fn mentioned_file<'a>(mention: &'a str, cwd: &Path) -> Option<(&'a str, PathBuf)> {
     let trimmed = mention.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '}', '"', '\'']);
-    [mention, trimmed].into_iter().filter(|name| !name.is_empty()).find_map(|name| {
+    [trimmed, mention].into_iter().filter(|name| !name.is_empty()).find_map(|name| {
         let path = crate::tools::resolve_path(name, cwd);
         path.is_file().then_some((name, path))
     })
