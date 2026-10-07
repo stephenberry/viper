@@ -4,7 +4,7 @@ A minimal coding agent for the terminal, written in Rust.
 
 viper is modeled on [pi](https://github.com/earendil-works/pi) but keeps only the essentials:
 
-- Anthropic models, directly or through a LiteLLM gateway
+- Claude models built in, plus any model behind an Anthropic- or OpenAI-compatible API, such as a LiteLLM gateway
 - Seven built-in tools: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`
 - Saved sessions with automatic compaction
 - `AGENTS.md` instructions and skills

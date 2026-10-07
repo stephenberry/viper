@@ -38,7 +38,9 @@ The built-in `anthropic` provider reads `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_
 
 Without a `models` list, only `baseUrl`, `apiKey`, `authHeader`, and `headers` apply. Adding a `models` list under `anthropic` replaces the built-in models with the ones listed.
 
-## LiteLLM
+## LiteLLM and other providers
+
+Any server with an Anthropic-compatible or OpenAI-compatible API can be added as a provider under a name of your choosing. The examples below use a LiteLLM gateway, which can front models from many vendors.
 
 The quickest setup is `/login litellm` followed by `/sync-models litellm` (see [Setting up a model provider](install.md#setting-up-a-model-provider)). You can also list models yourself. Each model reaches the gateway through either its Anthropic-compatible endpoint (`/v1/messages`) or its OpenAI-compatible endpoint (`/v1/chat/completions`), chosen per model with `api`:
 
