@@ -12,7 +12,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{Model, ThinkingLevel};
+use crate::config::{CacheRetention, Model, ThinkingLevel};
 use crate::message::{ContentBlock, Message, StopReason, Usage, UserMessage, content_text};
 use crate::provider::{self, ProviderError, Request};
 use crate::session::ContextItem;
@@ -334,6 +334,9 @@ async fn generate(
         // Summaries need little reasoning; use the cheapest level the model supports.
         thinking: model.clamp_thinking(ThinkingLevel::Off),
         max_tokens: Some(max_tokens.max(4_096).min(model.max_tokens.max(4_096))),
+        // A summary request shares no prefix with later requests, so a longer-lived cache entry
+        // would only cost more.
+        cache_retention: CacheRetention::Short,
     };
     let mut response = provider::new_assistant_message(model, request.thinking);
     provider::stream(client, &request, &mut response, &mut |_, _| {}, cancel).await?;

@@ -91,6 +91,10 @@ pub struct Usage {
     pub output: u64,
     pub cache_read: u64,
     pub cache_write: u64,
+    /// The part of `cache_write` written with one-hour retention; `None` when the provider did not
+    /// report it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write_1h: Option<u64>,
     pub total_tokens: u64,
     pub cost: Cost,
 }
@@ -106,6 +110,10 @@ impl Usage {
         self.output += other.output;
         self.cache_read += other.cache_read;
         self.cache_write += other.cache_write;
+        self.cache_write_1h = match (self.cache_write_1h, other.cache_write_1h) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+        };
         self.total_tokens += other.total_tokens;
         self.cost.input += other.cost.input;
         self.cost.output += other.cost.output;

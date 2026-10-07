@@ -343,12 +343,21 @@ impl App {
             0.0
         };
         let percent = if percent < 10.0 { format!("{percent:.1}") } else { format!("{percent:.0}") };
+        // Uncached input, output, and cache reads and writes are billed differently, so they are
+        // shown apart; cache reads, the bulk of a cached session's input, cost about a tenth.
+        let tokens = &stats.tokens;
         let mut right = format!(
             "{percent}%/{} · ↑{} ↓{}",
             format_tokens(stats.context_window),
-            format_tokens(stats.tokens.input + stats.tokens.cache_read + stats.tokens.cache_write),
-            format_tokens(stats.tokens.output)
+            format_tokens(tokens.input),
+            format_tokens(tokens.output)
         );
+        if tokens.cache_read > 0 {
+            right.push_str(&format!(" R{}", format_tokens(tokens.cache_read)));
+        }
+        if tokens.cache_write > 0 {
+            right.push_str(&format!(" W{}", format_tokens(tokens.cache_write)));
+        }
         if stats.auto_compact_window.is_some() {
             right.push_str(&format!(" · compact at {}", format_tokens(stats.compaction_threshold)));
         }
@@ -720,6 +729,7 @@ impl App {
                 self.notice(&format!("{} — retrying ({attempt}/{max_attempts})", sanitize(&error_message)));
             }
             AgentEvent::QueueUpdate { steering, follow_up } => self.queued = (steering, follow_up),
+            AgentEvent::CacheWarm { .. } => self.refresh_footer(),
         }
     }
 

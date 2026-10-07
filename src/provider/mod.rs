@@ -14,7 +14,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{Api, AuthHeader, Model, ThinkingLevel};
+use crate::config::{Api, AuthHeader, CacheRetention, Model, ThinkingLevel};
 use crate::message::{AssistantMessage, ContentBlock, Message, StopReason, Usage, now_ms};
 
 /// A tool declaration sent to the model.
@@ -33,6 +33,8 @@ pub struct Request<'a> {
     pub thinking: ThinkingLevel,
     /// Overrides the model's default output token limit.
     pub max_tokens: Option<u64>,
+    /// Lifetime of the cache breakpoints, for models with `cache_control`.
+    pub cache_retention: CacheRetention,
 }
 
 /// Incremental change to the streamed assistant message. `index` is the content block index.
@@ -213,8 +215,18 @@ pub async fn stream(
         Api::AnthropicMessages => anthropic::stream(client, request, &api_key, out, on_delta, cancel).await,
         Api::OpenAiCompletions => openai::stream(client, request, &api_key, out, on_delta, cancel).await,
     };
+    attribute_cache_writes(request, &mut out.usage);
     request.model.compute_cost(&mut out.usage);
     result
+}
+
+/// Without a breakdown of cache writes by retention from the provider, every write used the
+/// retention the request asked for.
+fn attribute_cache_writes(request: &Request<'_>, usage: &mut Usage) {
+    if request.model.cache_control && request.cache_retention == CacheRetention::Long && usage.cache_write_1h.is_none()
+    {
+        usage.cache_write_1h = Some(usage.cache_write);
+    }
 }
 
 /// Apply authentication and custom headers. Headers whose environment variable is unset are omitted.
@@ -421,6 +433,32 @@ fn same_model(message: &AssistantMessage, model: &Model) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreported_cache_writes_use_the_requested_retention() {
+        let model = crate::config::builtin_anthropic_models().remove(0);
+        let mut request = Request {
+            model: &model,
+            system_prompt: "",
+            messages: &[],
+            tools: &[],
+            thinking: ThinkingLevel::Off,
+            max_tokens: None,
+            cache_retention: CacheRetention::Long,
+        };
+        let mut usage = Usage { cache_write: 900, ..Default::default() };
+        attribute_cache_writes(&request, &mut usage);
+        assert_eq!(usage.cache_write_1h, Some(900));
+
+        // A reported breakdown is kept, and five-minute requests write no one-hour entries.
+        let mut reported = Usage { cache_write: 900, cache_write_1h: Some(0), ..Default::default() };
+        attribute_cache_writes(&request, &mut reported);
+        assert_eq!(reported.cache_write_1h, Some(0));
+        request.cache_retention = CacheRetention::Short;
+        let mut short = Usage { cache_write: 900, ..Default::default() };
+        attribute_cache_writes(&request, &mut short);
+        assert_eq!(short.cache_write_1h, None);
+    }
 
     #[test]
     fn v1_urls_accept_bases_with_or_without_v1() {

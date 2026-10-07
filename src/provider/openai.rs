@@ -118,12 +118,12 @@ fn convert_messages(request: &Request<'_>) -> Vec<Value> {
     out
 }
 
-fn add_cache_breakpoints(messages: &mut [Value]) {
+fn add_cache_breakpoints(messages: &mut [Value], cache_control: &Value) {
     let mark = |message: &mut Value| {
         if let Some(Value::Object(part)) =
             message.get_mut("content").and_then(Value::as_array_mut).and_then(|c| c.last_mut())
         {
-            part.insert("cache_control".into(), json!({"type": "ephemeral"}));
+            part.insert("cache_control".into(), cache_control.clone());
         }
     };
     if let Some(first) = messages.first_mut().filter(|m| m["role"] == "system") {
@@ -148,7 +148,7 @@ pub(super) fn build_body(request: &Request<'_>) -> Value {
 
     let mut messages = convert_messages(request);
     if model.cache_control {
-        add_cache_breakpoints(&mut messages);
+        add_cache_breakpoints(&mut messages, &request.cache_retention.cache_control());
     }
     body.insert("messages".into(), Value::Array(messages));
 
@@ -255,6 +255,9 @@ fn read_usage(usage: &Value, out: &mut AssistantMessage) {
     let cache_read =
         get("/cache_read_input_tokens").or_else(|| get("/prompt_tokens_details/cached_tokens")).unwrap_or(0);
     let cache_write = get("/cache_creation_input_tokens").unwrap_or(0);
+    // LiteLLM passes on Anthropic's breakdown of cache writes by retention when it has one.
+    out.usage.cache_write_1h = get("/prompt_tokens_details/cache_creation_token_details/ephemeral_1h_input_tokens")
+        .or_else(|| get("/cache_creation/ephemeral_1h_input_tokens"));
     out.usage.input = prompt.saturating_sub(cache_read + cache_write);
     out.usage.output = completion;
     out.usage.cache_read = cache_read;
@@ -410,7 +413,7 @@ pub(super) async fn stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Api, builtin_anthropic_models};
+    use crate::config::{Api, CacheRetention, builtin_anthropic_models};
     use crate::message::{ToolResultMessage, UserMessage};
 
     fn gateway_model() -> Model {
@@ -459,6 +462,7 @@ mod tests {
             tools: &[],
             thinking: ThinkingLevel::Xhigh,
             max_tokens: None,
+            cache_retention: CacheRetention::Short,
         };
         let body = build_body(&request);
         assert_eq!(body["reasoning_effort"], json!("high"));
@@ -469,6 +473,25 @@ mod tests {
         assert_eq!(msgs[3]["role"], json!("tool"));
         assert_eq!(msgs[4]["content"][1]["type"], json!("image_url"));
         assert_eq!(msgs[4]["content"][1]["cache_control"], json!({"type": "ephemeral"}));
+    }
+
+    #[test]
+    fn one_hour_retention_marks_breakpoints() {
+        let model = gateway_model();
+        let messages = vec![Message::User(UserMessage::new(vec![ContentBlock::text("hi")]))];
+        let request = Request {
+            model: &model,
+            system_prompt: "sys",
+            messages: &messages,
+            tools: &[],
+            thinking: ThinkingLevel::High,
+            max_tokens: None,
+            cache_retention: CacheRetention::Long,
+        };
+        let body = build_body(&request);
+        let marker = json!({"type": "ephemeral", "ttl": "1h"});
+        assert_eq!(body["messages"][0]["content"][0]["cache_control"], marker);
+        assert_eq!(body["messages"][1]["content"][0]["cache_control"], marker);
     }
 
     #[test]
@@ -483,7 +506,8 @@ mod tests {
             json!({"choices": [{"delta": {"content": "Hello"}}]}),
             json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "ls", "arguments": "{\"pa"}}]}}]}),
             json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "th\":\".\"}"}}]}, "finish_reason": "tool_calls"}]}),
-            json!({"choices": [], "usage": {"prompt_tokens": 100, "completion_tokens": 20, "prompt_tokens_details": {"cached_tokens": 60}}}),
+            json!({"choices": [], "usage": {"prompt_tokens": 100, "completion_tokens": 20, "cache_creation_input_tokens": 30,
+                "prompt_tokens_details": {"cached_tokens": 60, "cache_creation_token_details": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 30}}}}),
         ];
         for chunk in &chunks {
             handle_chunk(chunk, &mut out, &mut state, &mut sink).unwrap();
@@ -504,8 +528,9 @@ mod tests {
                 invalid_arguments: None
             }
         );
-        assert_eq!(out.usage.input, 40);
+        assert_eq!(out.usage.input, 10);
         assert_eq!(out.usage.cache_read, 60);
+        assert_eq!(out.usage.cache_write_1h, Some(30));
     }
 
     #[test]

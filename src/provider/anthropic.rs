@@ -137,11 +137,11 @@ fn convert_messages(messages: &[Message], model: &Model) -> Vec<Value> {
     out.into_iter().map(|(role, content)| json!({"role": role, "content": content})).collect()
 }
 
-fn add_cache_breakpoint(messages: &mut [Value]) {
+fn add_cache_breakpoint(messages: &mut [Value], cache_control: &Value) {
     let Some(last) = messages.last_mut() else { return };
     if let Some(Value::Object(block)) = last.get_mut("content").and_then(Value::as_array_mut).and_then(|c| c.last_mut())
     {
-        block.insert("cache_control".into(), json!({"type": "ephemeral"}));
+        block.insert("cache_control".into(), cache_control.clone());
     }
 }
 
@@ -153,17 +153,18 @@ pub(super) fn build_body(request: &Request<'_>) -> (Value, Vec<&'static str>) {
     body.insert("model".into(), json!(model.id));
     body.insert("stream".into(), json!(true));
 
+    let cache_control = request.cache_retention.cache_control();
     if !request.system_prompt.is_empty() {
         let mut system = json!({"type": "text", "text": request.system_prompt});
         if model.cache_control {
-            system["cache_control"] = json!({"type": "ephemeral"});
+            system["cache_control"] = cache_control.clone();
         }
         body.insert("system".into(), json!([system]));
     }
 
     let mut messages = convert_messages(request.messages, model);
     if model.cache_control {
-        add_cache_breakpoint(&mut messages);
+        add_cache_breakpoint(&mut messages, &cache_control);
     }
     body.insert("messages".into(), Value::Array(messages));
 
@@ -240,6 +241,9 @@ fn read_usage(usage: &Value, out: &mut AssistantMessage) {
     }
     if let Some(v) = get("cache_creation_input_tokens") {
         out.usage.cache_write = v;
+    }
+    if let Some(v) = usage.pointer("/cache_creation/ephemeral_1h_input_tokens").and_then(Value::as_u64) {
+        out.usage.cache_write_1h = Some(v);
     }
     if let Some(v) = get("output_tokens") {
         out.usage.output = v;
@@ -428,7 +432,7 @@ pub(super) async fn stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Api, builtin_anthropic_models};
+    use crate::config::{Api, CacheRetention, builtin_anthropic_models};
     use crate::message::{ToolResultMessage, UserMessage};
 
     fn opus() -> Model {
@@ -453,6 +457,7 @@ mod tests {
             tools: &[],
             thinking: ThinkingLevel::Off,
             max_tokens: None,
+            cache_retention: CacheRetention::Short,
         };
         let (body, betas) = build_body(&request);
         assert!(betas.is_empty());
@@ -526,6 +531,36 @@ mod tests {
         assert_eq!(converted[2]["content"][0]["is_error"], json!(true));
         assert_eq!(converted[2]["content"][1]["text"], json!("never mind"));
         assert_eq!(model.api, Api::AnthropicMessages);
+    }
+
+    #[test]
+    fn one_hour_retention_marks_breakpoints_and_costs_twice_the_input_price() {
+        let model = opus();
+        let messages = vec![Message::User(UserMessage::new(vec![ContentBlock::text("hi")]))];
+        let request = Request {
+            model: &model,
+            system_prompt: "sys",
+            messages: &messages,
+            tools: &[],
+            thinking: ThinkingLevel::High,
+            max_tokens: None,
+            cache_retention: CacheRetention::Long,
+        };
+        let (body, _) = build_body(&request);
+        let marker = json!({"type": "ephemeral", "ttl": "1h"});
+        assert_eq!(body["system"][0]["cache_control"], marker);
+        assert_eq!(body["messages"][0]["content"][0]["cache_control"], marker);
+
+        let mut out = super::super::new_assistant_message(&model, ThinkingLevel::High);
+        read_usage(
+            &json!({"input_tokens": 3, "cache_creation_input_tokens": 1_000_000, "output_tokens": 1,
+                    "cache_creation": {"ephemeral_5m_input_tokens": 400_000, "ephemeral_1h_input_tokens": 600_000}}),
+            &mut out,
+        );
+        assert_eq!(out.usage.cache_write_1h, Some(600_000));
+        model.compute_cost(&mut out.usage);
+        // Opus 5.5: $5 per million five-minute writes, 2 x $4 per million one-hour writes.
+        assert!((out.usage.cost.cache_write - (0.4 * 5.0 + 0.6 * 8.0)).abs() < 1e-9);
     }
 
     #[test]

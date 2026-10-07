@@ -200,6 +200,46 @@ impl FromStr for ThinkingLevel {
 // Settings
 // ---------------------------------------------------------------------------------------------
 
+/// How long cached prompt prefixes live (`cacheRetention`), for models with `cacheControl`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheRetention {
+    /// Five minutes, refreshed by each use. Writes cost 1.25x the input price.
+    #[default]
+    Short,
+    /// One hour, refreshed by each use. Writes cost 2x the input price, but the cache survives
+    /// longer pauses between messages.
+    Long,
+}
+
+impl CacheRetention {
+    /// How long an entry lives after it is written or last read.
+    pub fn ttl(self) -> std::time::Duration {
+        std::time::Duration::from_secs(match self {
+            CacheRetention::Short => 5 * 60,
+            CacheRetention::Long => 60 * 60,
+        })
+    }
+
+    /// The `cache_control` value that marks a cache breakpoint.
+    pub fn cache_control(self) -> Value {
+        match self {
+            CacheRetention::Short => serde_json::json!({"type": "ephemeral"}),
+            CacheRetention::Long => serde_json::json!({"type": "ephemeral", "ttl": "1h"}),
+        }
+    }
+}
+
+/// When to refresh the prompt cache before it expires (`cacheWarming`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheWarming {
+    Off,
+    /// While the agent is still working, e.g. during a long tool call.
+    #[default]
+    Streaming,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct CompactionSettings {
@@ -301,6 +341,8 @@ pub struct Settings {
     pub model_settings: BTreeMap<String, ModelSettings>,
     /// Interactive mode: install newer releases in the background (release builds only).
     pub auto_update: bool,
+    pub cache_retention: CacheRetention,
+    pub cache_warming: CacheWarming,
 }
 
 impl Default for Settings {
@@ -319,6 +361,8 @@ impl Default for Settings {
             tool_output_lines: 10,
             model_settings: BTreeMap::new(),
             auto_update: true,
+            cache_retention: CacheRetention::default(),
+            cache_warming: CacheWarming::default(),
         }
     }
 }
@@ -531,7 +575,10 @@ impl Model {
         usage.cost.input = per(usage.input, self.cost.input);
         usage.cost.output = per(usage.output, self.cost.output);
         usage.cost.cache_read = per(usage.cache_read, self.cost.cache_read);
-        usage.cost.cache_write = per(usage.cache_write, self.cost.cache_write);
+        // One-hour cache writes cost twice the input price; five-minute writes cost `cacheWrite`.
+        let long_writes = usage.cache_write_1h.unwrap_or(0).min(usage.cache_write);
+        usage.cost.cache_write =
+            per(usage.cache_write - long_writes, self.cost.cache_write) + per(long_writes, self.cost.input * 2.0);
         usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
     }
 }

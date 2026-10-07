@@ -18,15 +18,16 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::cache_warming;
 use crate::compaction::{self, CompactionResult};
-use crate::config::{Model, ModelRegistry, Settings, ThinkingLevel};
+use crate::config::{CacheRetention, CacheWarming, Model, ModelRegistry, Settings, ThinkingLevel};
 use crate::context::{ContextFile, Skill};
 use crate::message::{
     AssistantMessage, BashExecutionMessage, ContentBlock, Message, StopReason, ToolCallRef, ToolResultMessage, Usage,
     UserMessage, now_ms,
 };
 use crate::provider::{self, ErrorKind, Request, StreamDelta, ToolSpec};
-use crate::session::{Entry, SessionStore, iso_now, new_entry_id};
+use crate::session::{Entry, SessionStore, UsageKind, iso_now, new_entry_id};
 use crate::tools::{ShellConfig, Tool, ToolContext, ToolOutput, UpdateFn};
 
 // ---------------------------------------------------------------------------------------------
@@ -102,6 +103,10 @@ pub enum AgentEvent {
         steering: Vec<String>,
         follow_up: Vec<String>,
     },
+    /// The prompt cache was refreshed before it expired, at this cost (see `cache_warming`).
+    CacheWarm {
+        usage: Usage,
+    },
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -149,6 +154,19 @@ struct State {
     /// Auto-compact windows set per model (`provider/model-id`), from settings and `/autocompact`.
     auto_compact_windows: BTreeMap<String, u64>,
     auto_retry: bool,
+    /// Replaces the cache lifetime and refresh delay of the configured retention.
+    #[cfg(test)]
+    cache_timing: Option<cache_warming::Timing>,
+}
+
+/// A model request as sent, so it can be repeated to refresh its cached prefix.
+struct SentRequest {
+    model: Model,
+    thinking: ThinkingLevel,
+    messages: Vec<Message>,
+    retention: CacheRetention,
+    /// When the request was sent, so when its cache entry was written or last read.
+    started: Instant,
 }
 
 struct Inner {
@@ -243,6 +261,8 @@ impl Agent {
             cancel: None,
             steering: VecDeque::new(),
             follow_up: VecDeque::new(),
+            #[cfg(test)]
+            cache_timing: None,
         };
         let (idle, _) = watch::channel(true);
         let agent = Agent {
@@ -675,7 +695,7 @@ impl Agent {
             self.compact_if_needed(&cancel).await;
 
             self.emit(AgentEvent::TurnStart);
-            let (assistant, error) = self.stream_response(&cancel).await;
+            let (assistant, error, sent) = self.stream_response(&cancel).await;
             let overflow = error == Some(ErrorKind::ContextOverflow);
             let message = Message::Assistant(assistant.clone());
             self.append_message(message.clone());
@@ -697,7 +717,16 @@ impl Agent {
             }
 
             let has_tool_calls = assistant.tool_calls().next().is_some();
-            let tool_results = if has_tool_calls { self.execute_tools(&assistant, &cancel).await } else { Vec::new() };
+            let tool_results = if has_tool_calls {
+                let tools = self.execute_tools(&assistant, &cancel);
+                tokio::select! {
+                    biased;
+                    results = tools => results,
+                    never = self.keep_cache_warm(&sent, &assistant.usage, &cancel) => match never {},
+                }
+            } else {
+                Vec::new()
+            };
             for result in &tool_results {
                 self.append_message(result.clone());
                 new_messages.push(result.clone());
@@ -729,14 +758,17 @@ impl Agent {
     }
 
     /// Stream one assistant response, retrying transient failures that happen before any
-    /// content arrives. Failures are encoded in the returned message, with their kind beside it.
-    async fn stream_response(&self, cancel: &CancellationToken) -> (AssistantMessage, Option<ErrorKind>) {
+    /// content arrives. Failures are encoded in the returned message, with their kind beside it,
+    /// and the request is returned as sent.
+    async fn stream_response(&self, cancel: &CancellationToken) -> (AssistantMessage, Option<ErrorKind>, SentRequest) {
         let (model, thinking, messages, auto_retry) = {
             let state = self.state();
             (state.model.clone(), state.thinking, state.messages.clone(), state.auto_retry)
         };
-        let retry = &self.inner.setup.settings.retry;
+        let settings = &self.inner.setup.settings;
+        let retry = &settings.retry;
         let max_retries = if auto_retry { retry.max_retries } else { 0 };
+        let retention = settings.cache_retention;
         let request = Request {
             model: &model,
             system_prompt: &self.inner.setup.system_prompt,
@@ -744,6 +776,7 @@ impl Agent {
             tools: &self.inner.tool_specs,
             thinking,
             max_tokens: None,
+            cache_retention: retention,
         };
 
         let mut message = provider::new_assistant_message(&model, thinking);
@@ -792,7 +825,81 @@ impl Agent {
         };
         message.timestamp = now_ms() - started.elapsed().as_millis() as i64;
         message.duration_ms = Some(started.elapsed().as_millis() as u64);
-        (message, error)
+        let sent = SentRequest { model, thinking, messages, retention, started };
+        (message, error, sent)
+    }
+
+    /// While tools run, refresh the cached prefix of `sent` shortly before it expires whenever
+    /// that is cheaper than rewriting it (see `cache_warming`). Never returns; the caller drops it
+    /// when the tools finish.
+    async fn keep_cache_warm(
+        &self,
+        sent: &SentRequest,
+        usage: &Usage,
+        cancel: &CancellationToken,
+    ) -> std::convert::Infallible {
+        let enabled = self.inner.setup.settings.cache_warming == CacheWarming::Streaming;
+        let retention = cache_warming::applied_retention(sent.retention, usage);
+        let prompt_tokens = usage.input + usage.cache_read + usage.cache_write;
+        let timing = self.cache_timing(retention);
+        if let Some(timing) = timing
+            .filter(|_| enabled && cache_warming::worthwhile(&sent.model, sent.thinking, retention, prompt_tokens))
+        {
+            let mut last_used = sent.started;
+            loop {
+                let due = last_used + timing.delay;
+                if due > sent.started + cache_warming::MAX_WARMING_AGE {
+                    break;
+                }
+                tokio::time::sleep_until(due.into()).await;
+                let model_changed = self.state().model.key() != sent.model.key();
+                if Instant::now() > timing.deadline(due) || model_changed {
+                    break;
+                }
+                let refreshed = Instant::now();
+                if !self.refresh_cache(sent, cancel).await {
+                    break;
+                }
+                last_used = refreshed;
+            }
+        }
+        std::future::pending().await
+    }
+
+    fn cache_timing(&self, retention: CacheRetention) -> Option<cache_warming::Timing> {
+        #[cfg(test)]
+        if let Some(timing) = self.state().cache_timing {
+            return Some(timing);
+        }
+        cache_warming::Timing::for_ttl(retention.ttl())
+    }
+
+    /// Repeat `sent` with a one-token output limit, which reads its cached prefix and so renews
+    /// the cache. Records the cost in the session; returns whether the request succeeded.
+    async fn refresh_cache(&self, sent: &SentRequest, cancel: &CancellationToken) -> bool {
+        let request = Request {
+            model: &sent.model,
+            system_prompt: &self.inner.setup.system_prompt,
+            messages: &sent.messages,
+            tools: &self.inner.tool_specs,
+            thinking: sent.thinking,
+            max_tokens: Some(1),
+            cache_retention: sent.retention,
+        };
+        let mut response = provider::new_assistant_message(&sent.model, sent.thinking);
+        let result = provider::stream(&self.inner.client, &request, &mut response, &mut |_, _| {}, cancel).await;
+        if result.is_err() || matches!(response.stop_reason, StopReason::Error | StopReason::Aborted) {
+            return false;
+        }
+        let usage = response.usage;
+        let model = &sent.model;
+        if let Err(err) =
+            self.state().session.append_usage(UsageKind::CacheWarm, &model.provider, model.local_id(), usage)
+        {
+            eprintln!("warning: failed to save session: {err:#}");
+        }
+        self.emit(AgentEvent::CacheWarm { usage });
+        true
     }
 
     /// Execute the tool calls of `assistant` in order. Consecutive read-only calls run
@@ -1084,9 +1191,17 @@ mod tests {
     }
 
     fn agent(model: Model, cwd: &Path) -> (Agent, mpsc::UnboundedReceiver<AgentEvent>) {
+        let tools = crate::tools::select_tools(&["bash".into(), "read".into()]).unwrap();
+        agent_with_tools(model, cwd, tools)
+    }
+
+    fn agent_with_tools(
+        model: Model,
+        cwd: &Path,
+        tools: Vec<Arc<dyn Tool>>,
+    ) -> (Agent, mpsc::UnboundedReceiver<AgentEvent>) {
         let mut settings = Settings::default();
         settings.retry.base_delay_ms = 10;
-        let tools = crate::tools::select_tools(&["bash".into(), "read".into()]).unwrap();
         let setup = AgentSetup {
             cwd: cwd.to_path_buf(),
             settings,
@@ -1146,6 +1261,82 @@ mod tests {
                 Message::CompactionSummary(_) => "summary",
             })
             .collect()
+    }
+
+    /// Stands in for a long-running command: finishes once `done` holds.
+    struct WaitTool {
+        done: Box<dyn Fn() -> bool + Send + Sync>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for WaitTool {
+        fn name(&self) -> &'static str {
+            "wait"
+        }
+        fn description(&self) -> String {
+            "Wait".into()
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn snippet(&self) -> &'static str {
+            "Wait"
+        }
+        async fn execute(&self, _: &ToolContext, _: Value, _: UpdateFn) -> anyhow::Result<ToolOutput> {
+            while !(self.done)() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Ok(ToolOutput::text("waited"))
+        }
+    }
+
+    #[tokio::test]
+    async fn keeps_the_prompt_cache_warm_while_a_tool_runs() {
+        // The request before the tool call wrote a 100k-token cache entry: worth keeping.
+        let tool_call = MockResponse::anthropic(&[
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 10, "cache_creation_input_tokens": 100_000, "output_tokens": 1}}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "toolu_1", "name": "wait", "input": {}}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 5}}),
+            json!({"type": "message_stop"}),
+        ]);
+        let refresh = MockResponse::anthropic(&[
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 0, "cache_read_input_tokens": 100_010, "output_tokens": 1}}}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "max_tokens"}, "usage": {"output_tokens": 1}}),
+            json!({"type": "message_stop"}),
+        ]);
+        let server = MockServer::start(vec![tool_call, refresh, anthropic_text("done")]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let agent_slot: Arc<std::sync::OnceLock<Agent>> = Arc::default();
+        let slot = agent_slot.clone();
+        // The tool runs until the refresh has been recorded.
+        let tool =
+            WaitTool { done: Box::new(move || slot.get().is_some_and(|agent| agent.stats().tokens.cache_read > 0)) };
+        let (agent, mut events) =
+            agent_with_tools(model(&server.url, Api::AnthropicMessages), dir.path(), vec![Arc::new(tool)]);
+        agent.state().cache_timing =
+            Some(cache_warming::Timing { ttl: Duration::from_secs(5), delay: Duration::from_millis(200) });
+        agent_slot.set(agent.clone()).ok();
+
+        agent.prompt(vec![ContentBlock::text("wait")], None).unwrap();
+        // Without a refresh, the tool would wait forever.
+        tokio::time::timeout(Duration::from_secs(10), agent.wait_idle()).await.expect("the cache was not refreshed");
+
+        assert_eq!(agent.last_assistant_text().as_deref(), Some("done"));
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        // The refresh repeats the request before the tool call, asking for a single token.
+        assert_eq!(requests[1]["max_tokens"], json!(1));
+        assert_eq!(requests[1]["messages"], requests[0]["messages"]);
+        assert_eq!(requests[1]["system"], requests[0]["system"]);
+        assert_eq!(requests[2]["messages"][2]["content"][0]["tool_use_id"], json!("toolu_1"));
+        // Its cost counts toward the session.
+        assert_eq!(agent.stats().tokens.cache_read, 100_010);
+        let mut kinds = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            kinds.push(serde_json::to_value(&event).unwrap()["type"].as_str().unwrap().to_string());
+        }
+        assert_eq!(kinds.iter().filter(|kind| *kind == "cache_warm").count(), 1);
     }
 
     #[tokio::test]

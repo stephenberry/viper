@@ -68,6 +68,22 @@ pub enum Entry {
         timestamp: String,
         name: String,
     },
+    /// Tokens spent outside the conversation, counted in the session's cost.
+    Usage {
+        id: String,
+        timestamp: String,
+        kind: UsageKind,
+        provider: String,
+        model_id: String,
+        usage: Usage,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageKind {
+    /// A request that kept the prompt cache from expiring (see `crate::cache_warming`).
+    CacheWarm,
 }
 
 impl Entry {
@@ -78,7 +94,8 @@ impl Entry {
             | Entry::ModelChange { id, .. }
             | Entry::ThinkingLevelChange { id, .. }
             | Entry::Compaction { id, .. }
-            | Entry::SessionInfo { id, .. } => id,
+            | Entry::SessionInfo { id, .. }
+            | Entry::Usage { id, .. } => id,
         }
     }
 }
@@ -210,6 +227,17 @@ impl SessionStore {
         Ok(id)
     }
 
+    pub fn append_usage(&mut self, kind: UsageKind, provider: &str, model_id: &str, usage: Usage) -> Result<()> {
+        self.append(Entry::Usage {
+            id: new_entry_id(),
+            timestamp: iso_now(),
+            kind,
+            provider: provider.to_string(),
+            model_id: model_id.to_string(),
+            usage,
+        })
+    }
+
     /// Rebuild the model context from the entries.
     pub fn context(&self) -> Vec<ContextItem> {
         let compaction = self.entries.iter().enumerate().rev().find_map(|(index, entry)| match entry {
@@ -285,7 +313,7 @@ impl SessionStore {
         for entry in &self.entries {
             match entry {
                 Entry::Message { message: Message::Assistant(assistant), .. } => total.add(&assistant.usage),
-                Entry::Compaction { usage: Some(usage), .. } => total.add(usage),
+                Entry::Compaction { usage: Some(usage), .. } | Entry::Usage { usage, .. } => total.add(usage),
                 _ => {}
             }
         }
@@ -374,6 +402,23 @@ mod tests {
 
     fn in_memory() -> SessionStore {
         SessionStore::create(Path::new("/tmp/project"), false)
+    }
+
+    #[test]
+    fn usage_entries_count_toward_the_total_and_stay_out_of_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let mut store = in_memory();
+        store.path = Some(path.clone());
+        store.append_message(user("hi")).unwrap();
+        let usage = Usage { cache_read: 1_000, total_tokens: 1_001, output: 1, ..Default::default() };
+        store.append_usage(UsageKind::CacheWarm, "anthropic", "claude-opus-5-5", usage).unwrap();
+        assert_eq!(store.total_usage().cache_read, 1_000);
+        assert_eq!(store.messages().len(), 1);
+
+        let (reopened, warnings) = SessionStore::open(&path).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(reopened.total_usage().cache_read, 1_000);
     }
 
     #[test]

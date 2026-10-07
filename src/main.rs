@@ -1,5 +1,6 @@
 mod agent;
 mod auth;
+mod cache_warming;
 mod cli;
 mod compaction;
 mod config;

@@ -15,4 +15,4 @@ RPC commands do not change the saved `defaultModel` or `defaultThinkingLevel`.
 
 ## Events
 
-Events are also the `--mode json` output, which starts with a `session` line giving the session id, file, model, and thinking level: `agent_start`, `agent_end`, `turn_start`, `turn_end`, `message_start`, `message_update` (with an `assistantMessageEvent` delta: `text_*`, `thinking_*`, `toolcall_*`), `message_end`, `tool_execution_start`, `tool_execution_update`, `tool_execution_end`, `compaction_start`, `compaction_end`, `auto_retry_start`, and `queue_update`.
+Events are also the `--mode json` output, which starts with a `session` line giving the session id, file, model, and thinking level: `agent_start`, `agent_end`, `turn_start`, `turn_end`, `message_start`, `message_update` (with an `assistantMessageEvent` delta: `text_*`, `thinking_*`, `toolcall_*`), `message_end`, `tool_execution_start`, `tool_execution_update`, `tool_execution_end`, `compaction_start`, `compaction_end`, `auto_retry_start`, `queue_update`, and `cache_warm` (the prompt cache was refreshed during a long tool call, with the refresh's `usage`).
