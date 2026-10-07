@@ -62,11 +62,7 @@ viper keeps its configuration in `~/.viper` (see [Configuration](configuration.m
 
 **Anthropic:** set `ANTHROPIC_API_KEY`, or run `viper` and then `/login anthropic`.
 
-**A LiteLLM gateway:** run `viper`, then:
-
-1. `/login litellm` and enter the gateway's base URL and your API key. The key is checked and saved to `~/.viper/auth.json`.
-2. `/sync-models litellm` to add the gateway's models, with their limits and prices, to `~/.viper/models.json`.
-3. `/model` to pick a model. The choice becomes the default.
+**A LiteLLM gateway:** run `viper`, then `/login litellm` and enter the gateway's base URL and your API key. The key is checked and saved to `~/.viper/auth.json`, and the gateway's models, with their limits and prices, are added to `~/.viper/models.json`. If your current model has no key, the model picker opens; the model you choose becomes the default. Later, `/sync-models litellm` adds models the gateway has gained since, and `/model` switches models.
 
 **Copying an existing setup** from another machine:
 

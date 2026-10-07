@@ -821,6 +821,18 @@ fn provider_models(provider_name: &str, provider: &ProviderConfig) -> Result<Vec
     Ok(models)
 }
 
+/// The connection settings of a provider with no models, or nothing without a base URL to reach.
+fn provider_connection(provider_name: &str, provider: &ProviderConfig) -> Option<Model> {
+    let base_url = provider.base_url.as_deref()?;
+    Some(Model {
+        api: provider.api.unwrap_or(Api::OpenAiCompletions),
+        api_key: provider.api_key.as_deref().map(ConfigValue::parse),
+        auth_header: provider.auth_header.unwrap_or(AuthHeader::Bearer),
+        headers: provider.headers.iter().map(|(k, v)| (k.clone(), ConfigValue::parse(v))).collect(),
+        ..Model::connection(provider_name, base_url)
+    })
+}
+
 fn resolve_custom_model(provider_name: &str, provider: &ProviderConfig, config: &ModelConfig) -> Result<Model> {
     let base_url = provider
         .base_url
@@ -893,13 +905,23 @@ fn resolve_custom_model(provider_name: &str, provider: &ProviderConfig, config: 
 #[derive(Debug, Clone)]
 pub struct ModelRegistry {
     models: Vec<Model>,
+    /// Connection settings of models.json providers with no models yet (see `Model::connection`),
+    /// so `/login` and `/sync-models` can reach them. They are never offered as models.
+    connections: Vec<Model>,
 }
 
 impl ModelRegistry {
     pub fn load() -> Result<ModelRegistry> {
+        let mut registry = ModelRegistry::load_models(&models_path())?;
+        registry.apply_auth(&crate::auth::AuthStore::load()?);
+        Ok(registry)
+    }
+
+    /// The built-in models plus those in the models.json at `path`, without keys from auth.json.
+    fn load_models(path: &Path) -> Result<ModelRegistry> {
         let mut models = builtin_anthropic_models();
-        let path = models_path();
-        if let Some(value) = read_json_file(&path)? {
+        let mut connections = Vec::new();
+        if let Some(value) = read_json_file(path)? {
             let file: ModelsFile =
                 serde_json::from_value(value).with_context(|| format!("invalid {}", path.display()))?;
             for (provider_name, provider) in &file.providers {
@@ -919,6 +941,10 @@ impl ModelRegistry {
                     }
                     continue;
                 }
+                if provider.models.is_empty() {
+                    connections.extend(provider_connection(provider_name, provider));
+                    continue;
+                }
                 if provider_name == "anthropic" {
                     models.retain(|m| m.provider != "anthropic");
                 }
@@ -930,24 +956,22 @@ impl ModelRegistry {
                 }
             }
         }
-        let mut registry = ModelRegistry { models };
-        registry.apply_auth(&crate::auth::AuthStore::load()?);
-        Ok(registry)
+        Ok(ModelRegistry { models, connections })
     }
 
     /// Use keys saved by `/login`; they take precedence over `apiKey` in models.json.
     pub fn apply_auth(&mut self, auth: &crate::auth::AuthStore) {
-        for model in &mut self.models {
+        for model in self.models.iter_mut().chain(&mut self.connections) {
             if let Some(key) = auth.api_key(&model.provider) {
                 model.api_key = Some(ConfigValue::Literal(key.to_string()));
             }
         }
     }
 
-    /// Provider names, in the order their models are listed.
+    /// Provider names, in the order their models are listed, then those without models.
     pub fn providers(&self) -> Vec<&str> {
         let mut names: Vec<&str> = Vec::new();
-        for model in &self.models {
+        for model in self.models.iter().chain(&self.connections) {
             if !names.contains(&model.provider.as_str()) {
                 names.push(&model.provider);
             }
@@ -957,17 +981,17 @@ impl ModelRegistry {
 
     /// A model of `provider`, for its connection settings (base URL, API, auth header).
     pub fn provider_model(&self, provider: &str) -> Option<&Model> {
-        self.models.iter().find(|m| m.provider == provider)
+        self.models.iter().chain(&self.connections).find(|m| m.provider == provider)
     }
 
     #[cfg(test)]
     pub fn from_models(models: Vec<Model>) -> ModelRegistry {
-        ModelRegistry { models }
+        ModelRegistry { models, connections: Vec::new() }
     }
 
     /// Use `source` for every model of `provider`.
     pub fn set_api_key(&mut self, provider: &str, source: ConfigValue) {
-        for model in self.models.iter_mut().filter(|m| m.provider == provider) {
+        for model in self.models.iter_mut().chain(&mut self.connections).filter(|m| m.provider == provider) {
             model.api_key = Some(source.clone());
         }
     }
@@ -1046,7 +1070,9 @@ pub fn ensure_credentials(model: &Model) -> Result<()> {
     }
     let expected = model.api_key.as_ref().map(ConfigValue::describe).unwrap_or_else(|| "an apiKey".into());
     bail!(
-        "no API key for provider '{}' (expected {expected}); choose another model or configure the provider in {}",
+        "no API key for provider '{}' (expected {expected}); choose another model, run /login {} in viper, or configure \
+         the provider in {}",
+        model.provider,
         model.provider,
         models_path().display()
     )
@@ -1207,6 +1233,25 @@ mod tests {
         let mut registry = ModelRegistry::from_models(vec![model]);
         registry.apply_auth(&auth);
         assert_eq!(registry.all()[0].api_key, Some(ConfigValue::Literal("from-auth".into())));
+    }
+
+    #[test]
+    fn providers_without_models_keep_their_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(&path, r#"{"providers": {"gw": {"baseUrl": "https://gw", "headers": {"x-team": "a"}}}}"#)
+            .unwrap();
+        let mut registry = ModelRegistry::load_models(&path).unwrap();
+        let mut auth = crate::auth::AuthStore::default();
+        auth.set_api_key("gw", "sk-gw");
+        registry.apply_auth(&auth);
+
+        assert!(registry.all().iter().all(|model| model.provider != "gw"));
+        assert!(registry.providers().contains(&"gw"));
+        let connection = registry.provider_model("gw").unwrap();
+        assert_eq!(connection.base_url, "https://gw");
+        assert_eq!(connection.api_key, Some(ConfigValue::Literal("sk-gw".into())));
+        assert_eq!(connection.headers["x-team"], ConfigValue::Literal("a".into()));
     }
 
     #[test]

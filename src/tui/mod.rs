@@ -747,6 +747,10 @@ impl App {
                     Ok((report, registry)) => {
                         self.agent.set_registry(registry);
                         self.notice(&report.describe(&provider));
+                        // Still on a model without a key: offer the models that can be used now.
+                        if self.overlay.is_none() && !has_credentials(&self.agent.model()) {
+                            self.open_model_selector();
+                        }
                     }
                     Err(err) => self.error(&format!("Could not sync {provider}'s models: {err:#}")),
                 }
@@ -1208,18 +1212,24 @@ impl App {
 
     /// `/sync-models <provider>`: add the models the provider's server offers to models.json.
     fn sync_models(&mut self, args: &str) -> Result<()> {
-        let registry = self.agent.registry();
         let provider = args.trim();
         if provider.is_empty() || provider.contains(char::is_whitespace) {
-            bail!("Usage: /sync-models <provider> (configured: {})", registry.providers().join(", "));
+            bail!("Usage: /sync-models <provider> (configured: {})", self.agent.registry().providers().join(", "));
         }
+        self.spawn_model_sync(provider);
+        Ok(())
+    }
+
+    /// Add the models `provider`'s server offers to models.json in the background; the result
+    /// arrives as `AppMsg::ModelsSynced`.
+    fn spawn_model_sync(&mut self, provider: &str) {
         self.notice = Some(format!("Listing the models {provider} offers…"));
+        let registry = self.agent.registry();
         let (client, tx, provider) = (self.agent.http_client().clone(), self.app_tx.clone(), provider.to_string());
         tokio::spawn(async move {
             let result = crate::model_sync::sync(&client, &registry, &provider).await;
             let _ = tx.send(AppMsg::ModelsSynced(provider, result));
         });
-        Ok(())
     }
 
     /// `/login <provider>`: ask for the base URL and API key, check the key, and save it.
@@ -1320,6 +1330,8 @@ impl App {
             }
         };
         let configured = registry.all().iter().any(|model| model.provider == login.provider);
+        // A new provider whose server lists models gets them added right away.
+        let sync = !configured && matches!(login.check, CredentialCheck::Accepted(count) if count > 0);
         // Without a usable model, start using the provider just logged in to.
         let replacement = (!has_credentials(&self.agent.model()))
             .then(|| registry.available().into_iter().find(|model| model.provider == login.provider).cloned())
@@ -1335,8 +1347,11 @@ impl App {
             login.base_url,
             crate::util::tildify(&auth_path())
         );
-        if !configured {
-            text.push_str(" No models are configured for this provider yet; add them to models.json.");
+        if !configured && !sync {
+            text.push_str(&format!(
+                " No models are configured for this provider yet; run /sync-models {} to add the ones it offers.",
+                login.provider
+            ));
         }
         if let Some(label) = switched {
             text.push_str(&format!(" Now using {label}."));
@@ -1344,6 +1359,9 @@ impl App {
         match login.check {
             CredentialCheck::Accepted(_) => self.notice(&text),
             _ => self.warning(&text),
+        }
+        if sync {
+            self.spawn_model_sync(&login.provider);
         }
         self.refresh_footer();
     }
