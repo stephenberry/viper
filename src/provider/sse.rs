@@ -1,7 +1,7 @@
 //! Minimal Server-Sent Events decoder over a byte stream.
 
 use bytes::Bytes;
-use futures::{Stream, StreamExt};
+use futures_util::{Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 
 use super::ProviderError;

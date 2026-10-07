@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
-use futures::StreamExt;
-use futures::stream::FuturesUnordered;
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};

@@ -27,7 +27,7 @@ pub fn agent_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("VIPER_DIR").filter(|dir| !dir.is_empty()) {
         return PathBuf::from(dir);
     }
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".viper")
+    std::env::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".viper")
 }
 
 pub fn settings_path() -> PathBuf {
@@ -77,10 +77,10 @@ fn save_login_to(path: &Path, provider: &str, base_url: Option<&str>) -> Result<
 /// Expand a leading `~` to the home directory.
 pub fn expand_home(path: &str) -> PathBuf {
     if path == "~" {
-        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(path));
+        return std::env::home_dir().unwrap_or_else(|| PathBuf::from(path));
     }
     if let Some(rest) = path.strip_prefix("~/")
-        && let Some(home) = dirs::home_dir()
+        && let Some(home) = std::env::home_dir()
     {
         return home.join(rest);
     }

@@ -215,7 +215,7 @@ pub fn skill_dirs(cwd: &Path, settings: &Settings) -> Vec<PathBuf> {
         if path.is_absolute() { path } else { cwd.join(path) }
     }));
     dirs.push(agent_dir().join("skills"));
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = std::env::home_dir() {
         dirs.push(home.join(".agents").join("skills"));
     }
     dirs

@@ -10,6 +10,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -87,7 +88,7 @@ pub fn new_entry_id() -> String {
 }
 
 pub fn iso_now() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    crate::time::rfc3339_ms(crate::time::now_ms())
 }
 
 /// A message in the rebuilt context, with the entry it came from (`None` for the summary).
@@ -123,7 +124,7 @@ impl SessionStore {
             cwd: cwd.to_string_lossy().into_owned(),
         };
         let path = persist.then(|| {
-            let stamp = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S-%3fZ");
+            let stamp = crate::time::file_stamp(crate::time::now_ms());
             session_dir_for(cwd).join(format!("{stamp}_{}.jsonl", header.id))
         });
         SessionStore { header, entries: Vec::new(), path, file: None }
@@ -226,7 +227,7 @@ impl SessionStore {
         let Some((index, id, summary, first_kept, tokens_before, timestamp)) = compaction else {
             return self.entries.iter().filter_map(message_item).collect();
         };
-        let timestamp = chrono::DateTime::parse_from_rfc3339(timestamp).map(|t| t.timestamp_millis()).unwrap_or(0);
+        let timestamp = crate::time::parse_rfc3339_ms(timestamp).unwrap_or(0);
         let mut items = vec![ContextItem {
             entry_id: None,
             message: Message::CompactionSummary(CompactionSummaryMessage {
@@ -301,7 +302,12 @@ pub struct SessionSummary {
     pub name: Option<String>,
     pub first_message: String,
     pub message_count: usize,
-    pub modified: chrono::DateTime<chrono::Local>,
+    #[serde(serialize_with = "serialize_rfc3339")]
+    pub modified: SystemTime,
+}
+
+fn serialize_rfc3339<S: serde::Serializer>(time: &SystemTime, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&crate::time::rfc3339_ms(crate::time::system_time_ms(*time)))
 }
 
 fn summarize(path: &Path) -> Option<SessionSummary> {
@@ -328,7 +334,7 @@ fn summarize(path: &Path) -> Option<SessionSummary> {
         name: store.name(),
         first_message,
         message_count: count,
-        modified: modified.into(),
+        modified,
     })
 }
 

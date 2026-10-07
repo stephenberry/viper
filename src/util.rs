@@ -73,7 +73,7 @@ pub fn escape_xml(text: &str) -> String {
 
 /// Replace the home directory prefix with `~` for display.
 pub fn tildify(path: &std::path::Path) -> String {
-    if let Some(home) = dirs::home_dir()
+    if let Some(home) = std::env::home_dir()
         && let Ok(rest) = path.strip_prefix(&home)
     {
         if rest.as_os_str().is_empty() {

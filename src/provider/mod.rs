@@ -60,13 +60,20 @@ pub enum ErrorKind {
     Fatal,
 }
 
-#[derive(Debug, Clone, thiserror::Error)]
-#[error("{message}")]
+#[derive(Debug, Clone)]
 pub struct ProviderError {
     pub kind: ErrorKind,
     pub message: String,
     pub retry_after: Option<Duration>,
 }
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ProviderError {}
 
 impl ProviderError {
     pub fn fatal(message: impl Into<String>) -> Self {

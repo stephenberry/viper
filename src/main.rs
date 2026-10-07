@@ -12,6 +12,7 @@ mod provider;
 mod session;
 #[cfg(test)]
 mod testing;
+mod time;
 mod tools;
 mod tui;
 mod util;

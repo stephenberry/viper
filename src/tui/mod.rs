@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use futures::StreamExt;
+use futures_util::StreamExt;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -220,8 +220,8 @@ fn format_tokens(n: u64) -> String {
     }
 }
 
-fn relative_time(time: chrono::DateTime<chrono::Local>) -> String {
-    let secs = (chrono::Local::now() - time).num_seconds().max(0);
+fn relative_time(time: std::time::SystemTime) -> String {
+    let secs = std::time::SystemTime::now().duration_since(time).map_or(0, |elapsed| elapsed.as_secs());
     match secs {
         0..60 => "just now".into(),
         60..3600 => format!("{}m ago", secs / 60),
