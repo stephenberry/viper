@@ -1,6 +1,40 @@
 # Installing viper
 
-Each [GitHub release](https://github.com/stephenberry/viper/releases) has prebuilt binaries:
+## Quick install
+
+On Linux or macOS:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/stephenberry/viper/main/install.sh | sh
+```
+
+On Windows, in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/stephenberry/viper/main/install.ps1 | iex
+```
+
+The installer downloads the latest release for your platform, checks it against the release's `SHA256SUMS`, and installs it:
+
+| Platform | Location |
+|---|---|
+| Linux, macOS | `~/.local/bin/viper`. If that directory is not on your `PATH`, the installer prints the line to add. |
+| Windows | `%LOCALAPPDATA%\Programs\viper\viper.exe`, which is added to your user `PATH` |
+
+Run the same command again to update; your configuration in `~/.viper` is kept. To change what is installed, set these first:
+
+| Variable | Effect |
+|---|---|
+| `VIPER_VERSION` | Release to install, such as `v0.1.1` (default: the latest) |
+| `VIPER_INSTALL_DIR` | Directory for the binary |
+
+For example, `curl -fsSL https://raw.githubusercontent.com/stephenberry/viper/main/install.sh | VIPER_VERSION=v0.1.1 sh`.
+
+On Windows, viper runs tools through bash, so also install [Git for Windows](https://git-scm.com/download/win), which provides it. viper finds its bash automatically.
+
+## Manual install
+
+Each [GitHub release](https://github.com/stephenberry/viper/releases) has prebuilt binaries, with checksums in `SHA256SUMS`:
 
 | Platform | Archive |
 |---|---|
@@ -9,65 +43,16 @@ Each [GitHub release](https://github.com/stephenberry/viper/releases) has prebui
 | macOS (Intel and Apple silicon) | `viper-<version>-universal-apple-darwin.tar.gz` |
 | Windows x86_64 | `viper-<version>-x86_64-pc-windows-msvc.zip` |
 
-`SHA256SUMS` in each release lists the archives' checksums.
+Download the archive for your platform, check it with `sha256sum -c --ignore-missing SHA256SUMS` (`shasum -a 256 -c ...` on macOS), extract it, and put `viper` (or `viper.exe`) in a directory on your `PATH`.
 
-The commands below use the [GitHub CLI](https://cli.github.com) (`gh`), which works while the repository is private as long as you are logged in (`gh auth login`) with an account that has access. You can also download the files from the release page in a browser.
-
-## Linux
-
-1. Download the latest release for your CPU and verify it:
-
-   ```bash
-   case "$(uname -m)" in
-     x86_64)        target=x86_64-unknown-linux-musl ;;
-     aarch64|arm64) target=aarch64-unknown-linux-musl ;;
-     *)             echo "no prebuilt viper for $(uname -m); build from source" ;;
-   esac
-
-   cd "$(mktemp -d)"
-   gh release download -R stephenberry/viper -p "viper-*-$target.tar.gz" -p SHA256SUMS
-   sha256sum -c --ignore-missing SHA256SUMS
-   ```
-
-   The check prints `OK`. To install a specific version, add its tag after `download` (for example `gh release download v0.1.0 ...`).
-
-2. Unpack it and put `viper` on your `PATH`:
-
-   ```bash
-   tar xzf viper-*-"$target".tar.gz
-   mkdir -p ~/.local/bin
-   install -m 755 viper-*-"$target"/viper ~/.local/bin/viper
-   viper --version
-   ```
-
-   If the shell reports `viper: command not found`, add `export PATH="$HOME/.local/bin:$PATH"` to `~/.bashrc` (or `~/.zshrc`) and open a new shell.
-
-## macOS
-
-```bash
-cd "$(mktemp -d)"
-gh release download -R stephenberry/viper -p "viper-*-universal-apple-darwin.tar.gz" -p SHA256SUMS
-shasum -a 256 -c --ignore-missing SHA256SUMS
-tar xzf viper-*-universal-apple-darwin.tar.gz
-mkdir -p ~/.local/bin
-install -m 755 viper-*-universal-apple-darwin/viper ~/.local/bin/viper
-viper --version
-```
-
-If macOS blocks a binary downloaded in a browser, clear the quarantine flag: `xattr -d com.apple.quarantine ~/.local/bin/viper`.
-
-## Windows
-
-Download `viper-<version>-x86_64-pc-windows-msvc.zip`, extract `viper.exe` into a folder on your `PATH`, and run `viper --version`. viper runs tools through bash, so install [Git for Windows](https://git-scm.com/download/win), which provides it; viper finds its bash automatically.
+If macOS blocks a binary downloaded in a browser, clear the quarantine flag: `xattr -d com.apple.quarantine /path/to/viper`.
 
 ## From source
 
 With Rust 1.96 or newer:
 
 ```bash
-git clone https://github.com/stephenberry/viper.git
-cd viper
-cargo install --path .
+cargo install --locked --git https://github.com/stephenberry/viper
 ```
 
 ## Setting up a model provider
@@ -95,7 +80,3 @@ chmod 600 ~/.viper/auth.json
 If your gateway is only reachable over a VPN, make sure the VPN routes the gateway's host on this machine too; otherwise requests fail to connect.
 
 Then `cd` into a project and run `viper`.
-
-## Updating
-
-Repeat the download and install steps; the new binary replaces the old one. Your configuration in `~/.viper` is kept.

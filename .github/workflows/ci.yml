@@ -1,7 +1,5 @@
 name: CI
 
-# The repository is private, so Actions minutes are billed: pushes and pull requests run on
-# Linux only. Run the workflow manually to also test on macOS, Windows, or both.
 on:
   push:
     branches: [main]
@@ -9,12 +7,6 @@ on:
   pull_request:
     paths-ignore: ["**.md"]
   workflow_dispatch:
-    inputs:
-      platforms:
-        description: Platforms to test besides Linux
-        type: choice
-        options: [all, macos, windows]
-        default: all
 
 # A newer run of the same kind replaces an older one; a manual run never cancels a push run.
 concurrency:
@@ -28,17 +20,33 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  linux:
-    name: Lint and test (Linux)
+  format:
+    name: Format and shell lint
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+          components: rustfmt
       - run: cargo fmt --check
+      - run: shellcheck install.sh
+
+  test:
+    name: Lint and test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Per platform, since some code is Unix- or Windows-only.
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
 
@@ -55,17 +63,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets --locked
 
-  platforms:
-    name: Test (${{ matrix.os }})
-    if: github.event_name == 'workflow_dispatch'
+  # The installers in this commit, run against the latest published release.
+  install:
+    name: Installer (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(inputs.platforms == 'all' && '["macos-latest", "windows-latest"]' || format('["{0}-latest"]', inputs.platforms)) }}
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked
+      - name: Install with install.sh
+        if: runner.os != 'Windows'
+        env:
+          VIPER_INSTALL_DIR: ${{ runner.temp }}/viper-bin
+        run: |
+          sh install.sh
+          "$VIPER_INSTALL_DIR/viper" --version
+      # Windows PowerShell 5.1, the oldest shell the one-liner is likely to meet.
+      - name: Install with install.ps1
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          Get-Content -Raw install.ps1 | Invoke-Expression
+          & "$env:LOCALAPPDATA\Programs\viper\viper.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

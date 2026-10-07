@@ -11,13 +11,19 @@ viper is modeled on [pi](https://github.com/earendil-works/pi) but keeps only th
 
 ## Install
 
-Prebuilt binaries for Linux, macOS, and Windows are on the [releases page](https://github.com/stephenberry/viper/releases). See [docs/install.md](docs/install.md) for step-by-step instructions.
-
-To build from source (Rust 1.96 or newer):
+On Linux or macOS:
 
 ```bash
-cargo install --path .
+curl -fsSL https://raw.githubusercontent.com/stephenberry/viper/main/install.sh | sh
 ```
+
+On Windows, in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/stephenberry/viper/main/install.ps1 | iex
+```
+
+Run the same command again to update. See [docs/install.md](docs/install.md) for installing a specific version, manual downloads, and building from source.
 
 ## Quick start
 
@@ -80,7 +86,7 @@ Settings, providers, and API keys live in `~/.viper`. See [docs/configuration.md
 
 ## Development
 
-`cargo test` runs the tests; CI also checks `cargo fmt` and `cargo clippy`. Pushes and pull requests are tested on Linux; run the CI workflow manually to also test macOS or Windows.
+`cargo test` runs the tests. CI also checks `cargo fmt` and `cargo clippy`, tests on Linux, macOS, and Windows, and runs the installers against the latest release.
 
 To release, set `version` in `Cargo.toml`, commit, and push a matching tag (`git tag v0.2.0 && git push origin v0.2.0`).
 
