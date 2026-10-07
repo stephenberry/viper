@@ -32,17 +32,33 @@ pub const PROMPT_PREFIX: &str = "\u{1b}[36m›\u{1b}[0m ";
 pub const BODY_REST: &str = "    ";
 
 pub fn user_lines(content: &[ContentBlock]) -> Vec<Line> {
-    let text = sanitize(&content_text(content));
+    // Attached files are listed by name rather than shown in full.
+    let (attached, written): (Vec<&ContentBlock>, Vec<&ContentBlock>) = content.iter().partition(
+        |block| matches!(block, ContentBlock::Text { text } if crate::mentions::attachment_name(text).is_some()),
+    );
+    let written: Vec<ContentBlock> = written.into_iter().cloned().collect();
+    let text = sanitize(&content_text(&written));
     let images = content.iter().filter(|b| matches!(b, ContentBlock::Image { .. })).count();
     let mut lines: Vec<Line> = text
         .lines()
         .enumerate()
         .map(|(i, l)| Line::indented(format!("{BOLD}{l}{RESET}"), if i == 0 { PROMPT_PREFIX } else { "  " }, "  "))
         .collect();
+    let mut labels: Vec<String> = attached
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => {
+                crate::mentions::attachment_name(text).map(|name| format!("[file {}]", sanitize(name)))
+            }
+            _ => None,
+        })
+        .collect();
     if images > 0 {
-        let label = if images == 1 { "[1 image]".to_string() } else { format!("[{images} images]") };
+        labels.push(if images == 1 { "[1 image]".to_string() } else { format!("[{images} images]") });
+    }
+    if !labels.is_empty() {
         let prefix = if lines.is_empty() { PROMPT_PREFIX } else { "  " };
-        lines.push(Line::indented(dim(&label), prefix, "  "));
+        lines.push(Line::indented(dim(&labels.join(" ")), prefix, "  "));
     }
     lines
 }

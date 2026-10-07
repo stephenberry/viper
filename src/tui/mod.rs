@@ -4,6 +4,7 @@
 //! text, running tools, status, editor, and footer) is redrawn. See [`terminal::Screen`].
 
 mod editor;
+mod file_index;
 mod markdown;
 mod prompt;
 mod render;
@@ -15,6 +16,7 @@ mod text;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -82,6 +84,7 @@ enum AppMsg {
     LoginChecked(Box<CheckedLogin>),
     ModelsSynced(String, Result<SyncReport>),
     Budget(String, Result<crate::budget::Budget>),
+    FileIndex(Arc<file_index::FileIndex>),
     Update(crate::update::Outcome),
 }
 
@@ -153,6 +156,13 @@ struct App {
     /// Shown under the input while the prompt cache has expired and the next message would pay
     /// notably more to rewrite it (`refresh_stale_cache_hint`).
     stale_cache_hint: Option<String>,
+    /// The project's files for `@` completion, and when building it last started.
+    file_index: Option<Arc<file_index::FileIndex>>,
+    file_index_started: Option<Instant>,
+    /// Paths matching the `@` mention at the cursor, shown under the input.
+    file_completion: Option<FileCompletion>,
+    /// The mention (its offset and text) whose completions Esc hid.
+    file_completion_dismissed: Option<(usize, String)>,
     status: Option<String>,
     bash_live: Option<(String, String)>,
     queued: (Vec<String>, Vec<String>),
@@ -212,6 +222,18 @@ fn git_branch(cwd: &Path) -> Option<String> {
         Some(branch) => Some(branch.to_string()),
         None => Some(head.chars().take(7).collect()),
     }
+}
+
+/// How long `@` completion uses a file index before building it again.
+const FILE_INDEX_MAX_AGE: Duration = Duration::from_secs(30);
+
+/// Paths matching an `@` mention being typed.
+struct FileCompletion {
+    /// Byte offset of the `@` in the editor's text.
+    start: usize,
+    query: String,
+    /// Matching paths, best first, and whether each is a directory.
+    matches: Vec<(String, bool)>,
 }
 
 fn format_tokens(n: u64) -> String {
@@ -292,6 +314,10 @@ impl App {
             running_tools: Vec::new(),
             busy_since: None,
             stale_cache_hint: None,
+            file_index: None,
+            file_index_started: None,
+            file_completion: None,
+            file_completion_dismissed: None,
             status: None,
             bash_live: None,
             queued: (Vec::new(), Vec::new()),
@@ -558,7 +584,13 @@ impl App {
         }
         lines.push(border);
         let suggestions = self.suggestions();
-        if suggestions.is_empty() {
+        if let Some(completion) = &self.file_completion {
+            let selected = self.suggestion.min(completion.matches.len() - 1);
+            for (i, (path, _)) in completion.matches.iter().enumerate() {
+                let line = if i == selected { format!("{CYAN}{BOLD}@{path}{RESET}") } else { format!("@{path}") };
+                lines.push(truncate(&line, width));
+            }
+        } else if suggestions.is_empty() {
             if let Some(hint) = self.stale_cache_hint.as_ref().filter(|_| busy.is_none()) {
                 lines.push(paint(YELLOW, &truncate(hint, width)));
             }
@@ -803,6 +835,10 @@ impl App {
                 }
                 self.refresh_footer();
             }
+            AppMsg::FileIndex(index) => {
+                self.file_index = Some(index);
+                self.update_file_completion();
+            }
             AppMsg::Budget(provider, result) => {
                 self.notice = None;
                 match result {
@@ -831,7 +867,9 @@ impl App {
                     self.on_overlay_key(key)
                 } else {
                     self.notice = None;
-                    self.on_key(key)
+                    let result = self.on_key(key);
+                    self.update_file_completion();
+                    result
                 };
                 // A failed action (switching models, saving settings, ...) is reported and the
                 // session continues; terminal failures surface from drawing instead.
@@ -854,6 +892,7 @@ impl App {
                     }
                 } else {
                     self.editor.insert(&text.replace("\r\n", "\n").replace('\r', "\n"));
+                    self.update_file_completion();
                 }
             }
             _ => {}
@@ -869,6 +908,28 @@ impl App {
             self.last_ctrl_c = None;
         }
         let suggestions = self.suggestions();
+        if let Some(count) = self.file_completion.as_ref().map(|completion| completion.matches.len()) {
+            match key.code {
+                KeyCode::Enter | KeyCode::Tab if !shift && !alt => {
+                    self.accept_file_completion();
+                    return Ok(());
+                }
+                KeyCode::Up => {
+                    self.suggestion = self.suggestion.checked_sub(1).unwrap_or(count - 1);
+                    return Ok(());
+                }
+                KeyCode::Down => {
+                    self.suggestion = (self.suggestion + 1) % count;
+                    return Ok(());
+                }
+                KeyCode::Esc => {
+                    let (start, token) = self.editor.token_before_cursor();
+                    self.file_completion_dismissed = Some((start, token.to_string()));
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Enter if shift => self.editor.insert_newline(),
             KeyCode::Enter if alt => {
@@ -1142,10 +1203,58 @@ impl App {
             return Ok(());
         }
 
-        let content = crate::agent::user_content(&text, std::mem::take(&mut self.attachments));
+        let mut attachments = match crate::mentions::attachments(&text, self.agent.cwd()) {
+            Ok(files) => files,
+            Err(err) => {
+                self.editor.set_text(&text);
+                return Err(err);
+            }
+        };
+        attachments.append(&mut self.attachments);
+        let content = crate::agent::user_content(&text, attachments);
         let content = crate::modes::expand_skill(&self.agent, content)?;
         self.agent.prompt(content, queue)?;
         Ok(())
+    }
+
+    /// Build the file index for `@` completion in the background.
+    fn index_files(&mut self) {
+        self.file_index_started = Some(Instant::now());
+        let (root, tx) = (self.agent.cwd().to_path_buf(), self.app_tx.clone());
+        tokio::task::spawn_blocking(move || {
+            let _ = tx.send(AppMsg::FileIndex(Arc::new(file_index::FileIndex::build(&root))));
+        });
+    }
+
+    /// Find the paths matching the `@` mention at the cursor, if one is being typed.
+    fn update_file_completion(&mut self) {
+        let (start, token) = self.editor.token_before_cursor();
+        let dismissed = self.file_completion_dismissed.as_ref().is_some_and(|(at, text)| *at == start && text == token);
+        let Some(query) = token.strip_prefix('@').filter(|_| !dismissed && self.overlay.is_none()) else {
+            self.file_completion = None;
+            return;
+        };
+        let query = query.to_string();
+        if self.file_index_started.is_none_or(|started| started.elapsed() > FILE_INDEX_MAX_AGE) {
+            self.index_files();
+        }
+        let Some(index) = &self.file_index else { return };
+        let matches: Vec<(String, bool)> =
+            index.search(&query, 8).into_iter().map(|entry| (entry.path.clone(), entry.is_dir)).collect();
+        if self.file_completion.as_ref().is_none_or(|current| current.start != start || current.query != query) {
+            self.suggestion = 0;
+        }
+        self.file_completion = (!matches.is_empty()).then_some(FileCompletion { start, query, matches });
+    }
+
+    /// Put the selected path in place of the `@` mention being typed. A directory stays open for
+    /// completing a path inside it.
+    fn accept_file_completion(&mut self) {
+        let Some(completion) = self.file_completion.take() else { return };
+        let (path, is_dir) = &completion.matches[self.suggestion.min(completion.matches.len() - 1)];
+        let separator = if *is_dir { "" } else { " " };
+        self.editor.replace_before_cursor(completion.start, &format!("@{path}{separator}"));
+        self.suggestion = 0;
     }
 
     /// Update the hint shown when the prompt cache has expired; returns whether it changed. While

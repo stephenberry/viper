@@ -6,6 +6,7 @@ mod compaction;
 mod config;
 mod context;
 mod images;
+mod mentions;
 mod message;
 mod model_sync;
 mod modes;
@@ -83,19 +84,7 @@ fn initial_messages(args: &[String], cwd: &Path, stdin: Option<String>) -> Resul
             texts.push(arg.clone());
             continue;
         };
-        let path = tools::resolve_path(file, cwd);
-        if images::is_image_file(&path) {
-            let prepared = images::load_file(&path)?;
-            attachments.push(prepared.block);
-        } else {
-            let content =
-                std::fs::read_to_string(&path).with_context(|| format!("could not read {}", path.display()))?;
-            attachments.push(ContentBlock::text(format!(
-                "<file name=\"{}\">\n{}\n</file>",
-                path.display(),
-                content.trim_end()
-            )));
-        }
+        attachments.push(mentions::attach(&tools::resolve_path(file, cwd), file)?);
     }
     if let Some(stdin) = stdin.filter(|s| !s.trim().is_empty()) {
         attachments.insert(0, ContentBlock::text(stdin));

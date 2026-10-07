@@ -58,7 +58,7 @@ The default model is Claude Opus 5.5 with `high` thinking. `viper --list-models`
 | `viper --mode json "prompt"` | Stream agent events as JSON lines |
 | `viper --mode rpc` | Drive viper over stdin/stdout ([protocol](docs/rpc.md)) |
 
-Attach files with `@`, for example `viper @src/main.rs "explain this"`. In print and JSON modes, piped stdin is added to the prompt. Run `viper --help` for all options.
+Attach files with `@`, for example `viper @src/main.rs "explain this"`. In the interactive UI, typing `@` lists matching project files (↑↓ to choose, Tab or Enter to insert), and files mentioned this way are attached when you send; a directory or `@name` that is not a file stays plain text. In print and JSON modes, piped stdin is added to the prompt. Run `viper --help` for all options.
 
 ### Interactive UI
 
