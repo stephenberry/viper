@@ -108,7 +108,11 @@ fn convert_messages(request: &Request<'_>) -> Vec<Value> {
                 if result.is_error {
                     text = format!("Error: {text}");
                 }
-                out.push(json!({"role": "tool", "tool_call_id": result.tool_call_id, "content": text}));
+                // A text part can hold a cache breakpoint, which LiteLLM passes on to the tool
+                // result. Every tool message uses one so the prefix reads the same whether or not
+                // it holds the breakpoint.
+                let content = if model.cache_control { json!([{"type": "text", "text": text}]) } else { json!(text) };
+                out.push(json!({"role": "tool", "tool_call_id": result.tool_call_id, "content": content}));
             }
             Message::BashExecution(bash) => out.push(text_message("user", bash.to_context_text())),
             Message::CompactionSummary(summary) => out.push(text_message("user", summary.to_context_text())),
@@ -118,19 +122,22 @@ fn convert_messages(request: &Request<'_>) -> Vec<Value> {
     out
 }
 
+/// Mark the system prompt; the end of the conversation, where the next request reads the cache;
+/// and the end of the previous request (the message before the last assistant message), where
+/// this one reads it. A breakpoint finds an earlier entry only within 20 blocks of it, so without
+/// the last one a long turn would write the whole conversation again.
 fn add_cache_breakpoints(messages: &mut [Value], cache_control: &Value) {
-    let mark = |message: &mut Value| {
+    let system = messages.first().filter(|m| m["role"] == "system").map(|_| 0);
+    let previous_end = messages.iter().rposition(|m| m["role"] == "assistant").and_then(|i| i.checked_sub(1));
+    let last = messages.len().checked_sub(1);
+    let mut marked = [system, previous_end, last].into_iter().flatten().collect::<Vec<_>>();
+    marked.dedup();
+    for index in marked {
         if let Some(Value::Object(part)) =
-            message.get_mut("content").and_then(Value::as_array_mut).and_then(|c| c.last_mut())
+            messages[index].get_mut("content").and_then(Value::as_array_mut).and_then(|c| c.last_mut())
         {
             part.insert("cache_control".into(), cache_control.clone());
         }
-    };
-    if let Some(first) = messages.first_mut().filter(|m| m["role"] == "system") {
-        mark(first);
-    }
-    if let Some(last) = messages.iter_mut().rev().find(|m| m["content"].is_array()) {
-        mark(last);
     }
 }
 
@@ -147,8 +154,8 @@ pub(super) fn build_body(request: &Request<'_>) -> Value {
     body.insert("max_tokens".into(), json!(request.max_tokens.unwrap_or(model.max_tokens)));
 
     let mut messages = convert_messages(request);
-    if model.cache_control {
-        add_cache_breakpoints(&mut messages, &request.cache_retention.cache_control());
+    if let Some(retention) = request.cache_breakpoints() {
+        add_cache_breakpoints(&mut messages, &retention.cache_control());
     }
     body.insert("messages".into(), Value::Array(messages));
 
@@ -254,7 +261,11 @@ fn read_usage(usage: &Value, out: &mut AssistantMessage) {
     let completion = get("/completion_tokens").unwrap_or(0);
     let cache_read =
         get("/cache_read_input_tokens").or_else(|| get("/prompt_tokens_details/cached_tokens")).unwrap_or(0);
-    let cache_write = get("/cache_creation_input_tokens").unwrap_or(0);
+    // LiteLLM reports Anthropic's cache writes at the top level, OpenAI under the prompt details.
+    let cache_write = get("/cache_creation_input_tokens")
+        .or_else(|| get("/prompt_tokens_details/cache_write_tokens"))
+        .or_else(|| get("/prompt_tokens_details/cache_creation_tokens"))
+        .unwrap_or(0);
     // LiteLLM passes on Anthropic's breakdown of cache writes by retention when it has one.
     out.usage.cache_write_1h = get("/prompt_tokens_details/cache_creation_token_details/ephemeral_1h_input_tokens")
         .or_else(|| get("/cache_creation/ephemeral_1h_input_tokens"));
@@ -462,7 +473,7 @@ mod tests {
             tools: &[],
             thinking: ThinkingLevel::Xhigh,
             max_tokens: None,
-            cache_retention: CacheRetention::Short,
+            cache_retention: Some(CacheRetention::Short),
         };
         let body = build_body(&request);
         assert_eq!(body["reasoning_effort"], json!("high"));
@@ -471,8 +482,66 @@ mod tests {
         assert_eq!(msgs[2]["thinking_blocks"][0]["signature"], json!("s"));
         assert_eq!(msgs[2]["tool_calls"][0]["function"]["arguments"], json!("{\"path\":\"x.png\"}"));
         assert_eq!(msgs[3]["role"], json!("tool"));
+        assert_eq!(msgs[3]["content"][0]["text"], json!("Read image"));
         assert_eq!(msgs[4]["content"][1]["type"], json!("image_url"));
         assert_eq!(msgs[4]["content"][1]["cache_control"], json!({"type": "ephemeral"}));
+        // The end of the previous request, so this one finds its entry however long the turn.
+        assert_eq!(msgs[1]["content"][0]["cache_control"], json!({"type": "ephemeral"}));
+        assert_eq!(body.to_string().matches("cache_control").count(), 3);
+    }
+
+    #[test]
+    fn uncached_requests_have_no_breakpoints() {
+        let model = gateway_model();
+        let mut assistant = super::super::new_assistant_message(&model, ThinkingLevel::High);
+        assistant.content = vec![ContentBlock::ToolCall {
+            id: "c1".into(),
+            name: "ls".into(),
+            arguments: json!({}),
+            invalid_arguments: None,
+        }];
+        let messages = vec![
+            Message::User(UserMessage::new(vec![ContentBlock::text("list")])),
+            Message::Assistant(assistant),
+            Message::ToolResult(ToolResultMessage {
+                tool_call_id: "c1".into(),
+                tool_name: "ls".into(),
+                content: vec![ContentBlock::text("a.txt")],
+                is_error: false,
+                details: None,
+                timestamp: 0,
+                duration_ms: None,
+            }),
+        ];
+        let mut request = Request {
+            model: &model,
+            system_prompt: "sys",
+            messages: &messages,
+            tools: &[],
+            thinking: ThinkingLevel::High,
+            max_tokens: None,
+            cache_retention: None,
+        };
+        let body = build_body(&request);
+        assert!(!body.to_string().contains("cache_control"));
+
+        // Models without cache control keep plain tool messages, which every server accepts.
+        let plain = Model { cache_control: false, ..model.clone() };
+        request.model = &plain;
+        request.cache_retention = Some(CacheRetention::Long);
+        let body = build_body(&request);
+        assert!(!body.to_string().contains("cache_control"));
+        assert_eq!(body["messages"][3]["content"], json!("a.txt"));
+    }
+
+    #[test]
+    fn reads_cache_writes_from_prompt_details() {
+        let model = gateway_model();
+        let mut out = super::super::new_assistant_message(&model, ThinkingLevel::High);
+        let usage = json!({"prompt_tokens": 1000, "completion_tokens": 5,
+            "prompt_tokens_details": {"cached_tokens": 600, "cache_write_tokens": 300}});
+        read_usage(&usage, &mut out);
+        assert_eq!((out.usage.input, out.usage.cache_read, out.usage.cache_write), (100, 600, 300));
     }
 
     #[test]
@@ -486,7 +555,7 @@ mod tests {
             tools: &[],
             thinking: ThinkingLevel::High,
             max_tokens: None,
-            cache_retention: CacheRetention::Long,
+            cache_retention: Some(CacheRetention::Long),
         };
         let body = build_body(&request);
         let marker = json!({"type": "ephemeral", "ttl": "1h"});

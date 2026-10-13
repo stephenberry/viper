@@ -8,7 +8,7 @@ use super::{
     DeltaSink, ProviderError, Request, StreamDelta, apply_auth, finish_tool_call, merge_extra_body, normalize_messages,
     same_model, send, sse, v1_url,
 };
-use crate::config::{Model, Reasoning, ThinkingLevel};
+use crate::config::{CacheRetention, Model, Reasoning, ThinkingLevel};
 use crate::message::{AssistantMessage, ContentBlock, Message, StopReason};
 
 pub(super) const API_VERSION: &str = "2023-06-01";
@@ -137,11 +137,18 @@ fn convert_messages(messages: &[Message], model: &Model) -> Vec<Value> {
     out.into_iter().map(|(role, content)| json!({"role": role, "content": content})).collect()
 }
 
-fn add_cache_breakpoint(messages: &mut [Value], cache_control: &Value) {
-    let Some(last) = messages.last_mut() else { return };
-    if let Some(Value::Object(block)) = last.get_mut("content").and_then(Value::as_array_mut).and_then(|c| c.last_mut())
-    {
-        block.insert("cache_control".into(), cache_control.clone());
+/// Mark the end of the conversation, where the next request reads the cache, and the end of the
+/// previous request (the turn before the last assistant message), where this one reads it. A
+/// breakpoint finds an earlier entry only within 20 blocks of it, so without the second one a
+/// long turn, such as one with many attached files, would write the whole conversation again.
+fn add_cache_breakpoints(messages: &mut [Value], cache_control: &Value) {
+    let previous_end = messages.iter().rposition(|m| m["role"] == "assistant").and_then(|i| i.checked_sub(1));
+    for index in previous_end.into_iter().chain(messages.len().checked_sub(1)) {
+        if let Some(Value::Object(block)) =
+            messages[index].get_mut("content").and_then(Value::as_array_mut).and_then(|c| c.last_mut())
+        {
+            block.insert("cache_control".into(), cache_control.clone());
+        }
     }
 }
 
@@ -153,18 +160,18 @@ pub(super) fn build_body(request: &Request<'_>) -> (Value, Vec<&'static str>) {
     body.insert("model".into(), json!(model.id));
     body.insert("stream".into(), json!(true));
 
-    let cache_control = request.cache_retention.cache_control();
+    let cache_control = request.cache_breakpoints().map(CacheRetention::cache_control);
     if !request.system_prompt.is_empty() {
         let mut system = json!({"type": "text", "text": request.system_prompt});
-        if model.cache_control {
+        if let Some(cache_control) = &cache_control {
             system["cache_control"] = cache_control.clone();
         }
         body.insert("system".into(), json!([system]));
     }
 
     let mut messages = convert_messages(request.messages, model);
-    if model.cache_control {
-        add_cache_breakpoint(&mut messages, &cache_control);
+    if let Some(cache_control) = &cache_control {
+        add_cache_breakpoints(&mut messages, cache_control);
     }
     body.insert("messages".into(), Value::Array(messages));
 
@@ -457,7 +464,7 @@ mod tests {
             tools: &[],
             thinking: ThinkingLevel::Off,
             max_tokens: None,
-            cache_retention: CacheRetention::Short,
+            cache_retention: Some(CacheRetention::Short),
         };
         let (body, betas) = build_body(&request);
         assert!(betas.is_empty());
@@ -466,6 +473,36 @@ mod tests {
         assert_eq!(body["output_config"], json!({"effort": "low"}));
         assert_eq!(body["system"][0]["cache_control"], json!({"type": "ephemeral"}));
         assert_eq!(body["messages"][0]["content"][0]["cache_control"], json!({"type": "ephemeral"}));
+    }
+
+    #[test]
+    fn marks_the_end_of_the_previous_request() {
+        let model = opus();
+        // A turn with more blocks than the cache looks back over.
+        let files = (0..25).map(|i| ContentBlock::text(format!("file {i}"))).collect();
+        let messages = vec![
+            Message::User(UserMessage::new(vec![ContentBlock::text("first")])),
+            Message::Assistant(assistant(&model, vec![ContentBlock::text("ok")], StopReason::Stop)),
+            Message::User(UserMessage::new(files)),
+        ];
+        let mut request = Request {
+            model: &model,
+            system_prompt: "sys",
+            messages: &messages,
+            tools: &[],
+            thinking: ThinkingLevel::High,
+            max_tokens: None,
+            cache_retention: Some(CacheRetention::Long),
+        };
+        let (body, _) = build_body(&request);
+        let marker = json!({"type": "ephemeral", "ttl": "1h"});
+        assert_eq!(body["messages"][0]["content"][0]["cache_control"], marker);
+        assert_eq!(body["messages"][2]["content"][24]["cache_control"], marker);
+        assert_eq!(body.to_string().matches("cache_control").count(), 3);
+
+        request.cache_retention = None;
+        let (body, _) = build_body(&request);
+        assert!(!body.to_string().contains("cache_control"));
     }
 
     #[test]
@@ -544,7 +581,7 @@ mod tests {
             tools: &[],
             thinking: ThinkingLevel::High,
             max_tokens: None,
-            cache_retention: CacheRetention::Long,
+            cache_retention: Some(CacheRetention::Long),
         };
         let (body, _) = build_body(&request);
         let marker = json!({"type": "ephemeral", "ttl": "1h"});

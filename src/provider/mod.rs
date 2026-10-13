@@ -33,8 +33,17 @@ pub struct Request<'a> {
     pub thinking: ThinkingLevel,
     /// Overrides the model's default output token limit.
     pub max_tokens: Option<u64>,
-    /// Lifetime of the cache breakpoints, for models with `cache_control`.
-    pub cache_retention: CacheRetention,
+    /// Lifetime of the cache breakpoints, for models with `cache_control`. `None` marks none, for
+    /// requests whose prefix no later request shares, which would pay to write an entry that is
+    /// never read.
+    pub cache_retention: Option<CacheRetention>,
+}
+
+impl Request<'_> {
+    /// The retention of the request's cache breakpoints, if it has any.
+    pub fn cache_breakpoints(&self) -> Option<CacheRetention> {
+        self.cache_retention.filter(|_| self.model.cache_control)
+    }
 }
 
 /// Incremental change to the streamed assistant message. `index` is the content block index.
@@ -223,8 +232,7 @@ pub async fn stream(
 /// Without a breakdown of cache writes by retention from the provider, every write used the
 /// retention the request asked for.
 fn attribute_cache_writes(request: &Request<'_>, usage: &mut Usage) {
-    if request.model.cache_control && request.cache_retention == CacheRetention::Long && usage.cache_write_1h.is_none()
-    {
+    if request.cache_breakpoints() == Some(CacheRetention::Long) && usage.cache_write_1h.is_none() {
         usage.cache_write_1h = Some(usage.cache_write);
     }
 }
@@ -444,7 +452,7 @@ mod tests {
             tools: &[],
             thinking: ThinkingLevel::Off,
             max_tokens: None,
-            cache_retention: CacheRetention::Long,
+            cache_retention: Some(CacheRetention::Long),
         };
         let mut usage = Usage { cache_write: 900, ..Default::default() };
         attribute_cache_writes(&request, &mut usage);
@@ -454,7 +462,7 @@ mod tests {
         let mut reported = Usage { cache_write: 900, cache_write_1h: Some(0), ..Default::default() };
         attribute_cache_writes(&request, &mut reported);
         assert_eq!(reported.cache_write_1h, Some(0));
-        request.cache_retention = CacheRetention::Short;
+        request.cache_retention = Some(CacheRetention::Short);
         let mut short = Usage { cache_write: 900, ..Default::default() };
         attribute_cache_writes(&request, &mut short);
         assert_eq!(short.cache_write_1h, None);

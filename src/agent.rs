@@ -154,6 +154,8 @@ struct State {
     /// Auto-compact windows set per model (`provider/model-id`), from settings and `/autocompact`.
     auto_compact_windows: BTreeMap<String, u64>,
     auto_retry: bool,
+    /// Lifetime of the cache breakpoints in model requests, from settings and `/cache`.
+    cache_retention: CacheRetention,
     /// Replaces the cache lifetime and refresh delay of the configured retention.
     #[cfg(test)]
     cache_timing: Option<prompt_cache::Timing>,
@@ -200,6 +202,7 @@ pub struct AgentSnapshot {
     /// Context size at which auto-compaction actually triggers for the current model.
     pub compaction_threshold: u64,
     pub auto_retry_enabled: bool,
+    pub cache_retention: CacheRetention,
     pub message_count: usize,
     pub pending_message_count: usize,
 }
@@ -252,6 +255,7 @@ impl Agent {
                 .filter_map(|(key, settings)| Some((key.clone(), settings.auto_compact_window?)))
                 .collect(),
             auto_retry: setup.settings.retry.enabled,
+            cache_retention: setup.settings.cache_retention,
             registry: Arc::new(registry),
             model,
             thinking,
@@ -362,6 +366,7 @@ impl Agent {
             auto_compact_window: self.configured_window(&state),
             compaction_threshold: self.threshold(&state),
             auto_retry_enabled: state.auto_retry,
+            cache_retention: state.cache_retention,
             message_count: state.messages.len(),
             pending_message_count: state.steering.len() + state.follow_up.len(),
         }
@@ -415,7 +420,7 @@ impl Agent {
         }
         // The request that produced `last` used the cache when it started, at its timestamp.
         let idle = Duration::from_millis(u64::try_from(now_ms() - last.timestamp).unwrap_or(0));
-        let retention = prompt_cache::applied_retention(self.inner.setup.settings.cache_retention, &last.usage);
+        let retention = prompt_cache::applied_retention(state.cache_retention, &last.usage);
         prompt_cache::stale_cache(model, retention, last.usage.context_tokens(), idle)
     }
 
@@ -518,6 +523,12 @@ impl Agent {
 
     pub fn set_auto_retry(&self, enabled: bool) {
         self.state().auto_retry = enabled;
+    }
+
+    /// Set the lifetime of cache entries written by later requests. Persisting it is the
+    /// caller's choice.
+    pub fn set_cache_retention(&self, retention: CacheRetention) {
+        self.state().cache_retention = retention;
     }
 
     pub fn set_session_name(&self, name: &str) -> Result<()> {
@@ -780,14 +791,12 @@ impl Agent {
     /// content arrives. Failures are encoded in the returned message, with their kind beside it,
     /// and the request is returned as sent.
     async fn stream_response(&self, cancel: &CancellationToken) -> (AssistantMessage, Option<ErrorKind>, SentRequest) {
-        let (model, thinking, messages, auto_retry) = {
+        let (model, thinking, messages, auto_retry, retention) = {
             let state = self.state();
-            (state.model.clone(), state.thinking, state.messages.clone(), state.auto_retry)
+            (state.model.clone(), state.thinking, state.messages.clone(), state.auto_retry, state.cache_retention)
         };
-        let settings = &self.inner.setup.settings;
-        let retry = &settings.retry;
+        let retry = &self.inner.setup.settings.retry;
         let max_retries = if auto_retry { retry.max_retries } else { 0 };
-        let retention = settings.cache_retention;
         let request = Request {
             model: &model,
             system_prompt: &self.inner.setup.system_prompt,
@@ -795,7 +804,7 @@ impl Agent {
             tools: &self.inner.tool_specs,
             thinking,
             max_tokens: None,
-            cache_retention: retention,
+            cache_retention: Some(retention),
         };
 
         let mut message = provider::new_assistant_message(&model, thinking);
@@ -903,7 +912,7 @@ impl Agent {
             tools: &self.inner.tool_specs,
             thinking: sent.thinking,
             max_tokens: Some(1),
-            cache_retention: sent.retention,
+            cache_retention: Some(sent.retention),
         };
         let mut response = provider::new_assistant_message(&sent.model, sent.thinking);
         let result = provider::stream(&self.inner.client, &request, &mut response, &mut |_, _| {}, cancel).await;
@@ -1323,15 +1332,36 @@ mod tests {
         };
         assert_eq!(agent.stale_cache(), None);
 
-        agent.state().messages.push(reply(3, &model.id));
+        agent.state().messages.push(reply(30, &model.id));
         assert_eq!(agent.stale_cache(), None);
-        agent.state().messages.push(reply(12, &model.id));
+        agent.state().messages.push(reply(70, &model.id));
         let stale = agent.stale_cache().unwrap();
         assert_eq!(stale.tokens, 401_000);
-        assert_eq!(stale.idle.as_secs() / 60, 12);
+        assert_eq!(stale.idle.as_secs() / 60, 70);
         // A context last sent to another model has no cache entry for this one to lose.
-        agent.state().messages.push(reply(12, "claude-sonnet-5-5"));
+        agent.state().messages.push(reply(70, "claude-sonnet-5-5"));
         assert_eq!(agent.stale_cache(), None);
+        // Five-minute entries expire sooner.
+        agent.set_cache_retention(CacheRetention::Short);
+        agent.state().messages.push(reply(12, &model.id));
+        assert_eq!(agent.stale_cache().unwrap().idle.as_secs() / 60, 12);
+    }
+
+    #[tokio::test]
+    async fn requests_use_the_current_cache_retention() {
+        let server = MockServer::start(vec![anthropic_text("one"), anthropic_text("two")]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, _events) = agent(model(&server.url, Api::AnthropicMessages), dir.path());
+        agent.prompt(vec![ContentBlock::text("first")], None).unwrap();
+        agent.wait_idle().await;
+        agent.set_cache_retention(CacheRetention::Short);
+        agent.prompt(vec![ContentBlock::text("second")], None).unwrap();
+        agent.wait_idle().await;
+
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests[0]["system"][0]["cache_control"], json!({"type": "ephemeral", "ttl": "1h"}));
+        assert_eq!(requests[1]["system"][0]["cache_control"], json!({"type": "ephemeral"}));
+        assert_eq!(requests[1]["messages"][2]["content"][0]["cache_control"], json!({"type": "ephemeral"}));
     }
 
     #[tokio::test]
@@ -1435,8 +1465,13 @@ mod tests {
         assert_eq!(agent.last_assistant_text().as_deref(), Some("all good"));
         let requests = server.requests.lock().unwrap();
         assert_eq!(requests[0]["reasoning_effort"], json!("high"));
-        assert_eq!(requests[1]["messages"][3]["role"], json!("tool"));
-        assert_eq!(requests[1]["messages"][3]["content"], json!("hi"));
+        let messages = &requests[1]["messages"];
+        assert_eq!(messages[3]["role"], json!("tool"));
+        assert_eq!(messages[3]["content"][0]["text"], json!("hi"));
+        // The tool result ends the conversation so far, and the prompt ended the previous request.
+        let marker = json!({"type": "ephemeral", "ttl": "1h"});
+        assert_eq!(messages[3]["content"][0]["cache_control"], marker);
+        assert_eq!(messages[1]["content"][0]["cache_control"], marker);
     }
 
     #[tokio::test]

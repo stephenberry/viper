@@ -51,11 +51,16 @@ impl Timing {
     }
 }
 
-/// The retention a request's cache entry actually got. Some providers ignore a request for
-/// one-hour retention and write five-minute entries, which shows in the reported breakdown.
+/// The retention the cache entry of the request that reported `usage` actually got, as shown by
+/// the reported breakdown of its writes, or else `requested`. The breakdown catches providers
+/// that ignore a request for one-hour retention and write five-minute entries, and requests sent
+/// before the retention was changed (`/cache`).
 pub fn applied_retention(requested: CacheRetention, usage: &Usage) -> CacheRetention {
-    let wrote_only_short = usage.cache_write > 0 && usage.cache_write_1h == Some(0);
-    if requested == CacheRetention::Long && wrote_only_short { CacheRetention::Short } else { requested }
+    match usage.cache_write_1h {
+        Some(long) if long > 0 => CacheRetention::Long,
+        Some(_) if usage.cache_write > 0 => CacheRetention::Short,
+        _ => requested,
+    }
 }
 
 /// Whether to keep the cache of a request with `prompt_tokens` warm while its tools run.
@@ -202,14 +207,18 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_five_minutes_when_one_hour_retention_is_ignored() {
+    fn applied_retention_follows_the_reported_writes() {
         let ignored = Usage { cache_write: 900, cache_write_1h: Some(0), ..Default::default() };
         assert_eq!(applied_retention(CacheRetention::Long, &ignored), CacheRetention::Short);
         let honored = Usage { cache_write: 900, cache_write_1h: Some(900), ..Default::default() };
         assert_eq!(applied_retention(CacheRetention::Long, &honored), CacheRetention::Long);
         // Nothing written, nothing learned.
         assert_eq!(applied_retention(CacheRetention::Long, &Usage::default()), CacheRetention::Long);
-        assert_eq!(applied_retention(CacheRetention::Short, &honored), CacheRetention::Short);
+        assert_eq!(applied_retention(CacheRetention::Short, &Usage::default()), CacheRetention::Short);
+        // A request sent before the retention changed keeps the retention it was sent with.
+        assert_eq!(applied_retention(CacheRetention::Short, &honored), CacheRetention::Long);
+        let short = Usage { cache_write: 900, cache_write_1h: Some(0), ..Default::default() };
+        assert_eq!(applied_retention(CacheRetention::Long, &short), CacheRetention::Short);
     }
 
     #[test]

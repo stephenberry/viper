@@ -27,7 +27,9 @@ use tokio::sync::mpsc;
 
 use crate::agent::{Agent, AgentEvent, Busy, CompactionReason, QueueMode};
 use crate::auth::{AuthStore, auth_path};
-use crate::config::{Model, ModelRegistry, Settings, ThinkingLevel, has_credentials, parse_auto_compact_window};
+use crate::config::{
+    CacheRetention, Model, ModelRegistry, Settings, ThinkingLevel, has_credentials, parse_auto_compact_window,
+};
 use crate::message::{BashExecutionMessage, ContentBlock, Message, StopReason};
 use crate::model_sync::SyncReport;
 use crate::provider::{CredentialCheck, StreamDelta};
@@ -50,6 +52,7 @@ const COMMANDS: &[(&str, &str, bool)] = &[
     ("name", "Name the session: /name <name>", true),
     ("compact", "Compact the context: /compact [focus]", false),
     ("autocompact", "Set when auto-compaction runs: /autocompact <size>|auto|off|on", false),
+    ("cache", "Set how long the prompt cache lasts: /cache long|short", false),
     ("login", "Save a provider's base URL and API key: /login <provider>", true),
     ("sync-models", "Add a provider's new server models to models.json: /sync-models <provider>", true),
     ("copy", "Copy the last response to the clipboard", false),
@@ -1316,6 +1319,7 @@ impl App {
                 self.agent.compact((!args.is_empty()).then(|| args.to_string()))?;
             }
             "autocompact" => self.autocompact(args)?,
+            "cache" => self.cache_retention(args)?,
             "login" => self.start_login(args),
             "sync-models" => self.sync_models(args)?,
             "budget" => self.check_budget(args)?,
@@ -1386,6 +1390,39 @@ impl App {
             self.error(&format!("The change applies to this session but could not be saved: {err:#}"));
         }
         self.refresh_footer();
+        Ok(())
+    }
+
+    /// `/cache [long|short]`: change how long the prompt cache lasts, saving the choice to the
+    /// global settings.
+    fn cache_retention(&mut self, args: &str) -> Result<()> {
+        let arg = args.trim();
+        let saved = if arg.is_empty() {
+            Ok(())
+        } else {
+            let retention: CacheRetention = arg.parse()?;
+            self.agent.set_cache_retention(retention);
+            Settings::save_cache_retention(retention)
+        };
+
+        let snapshot = self.agent.snapshot();
+        let mut text = match snapshot.cache_retention {
+            CacheRetention::Long => "The prompt cache lasts an hour after each use; writes cost 2x the input price.",
+            CacheRetention::Short => {
+                "The prompt cache lasts 5 minutes after each use; writes cost 1.25x the input price."
+            }
+        }
+        .to_string();
+        if !snapshot.model.cache_control {
+            text.push_str(&format!(" {} does not use it.", self.agent.registry().label(&snapshot.model)));
+        }
+        if arg.is_empty() {
+            text.push_str(" Change it with /cache long or /cache short.");
+        }
+        self.notice(&text);
+        if let Err(err) = saved {
+            self.error(&format!("The change applies to this session but could not be saved: {err:#}"));
+        }
         Ok(())
     }
 

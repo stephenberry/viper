@@ -205,14 +205,23 @@ impl FromStr for ThinkingLevel {
 #[serde(rename_all = "lowercase")]
 pub enum CacheRetention {
     /// Five minutes, refreshed by each use. Writes cost 1.25x the input price.
-    #[default]
+    #[serde(alias = "5m")]
     Short,
     /// One hour, refreshed by each use. Writes cost 2x the input price, but the cache survives
-    /// longer pauses between messages.
+    /// longer pauses between messages, such as waiting on a build or test run.
+    #[default]
+    #[serde(alias = "1h")]
     Long,
 }
 
 impl CacheRetention {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CacheRetention::Short => "short",
+            CacheRetention::Long => "long",
+        }
+    }
+
     /// How long an entry lives after it is written or last read.
     pub fn ttl(self) -> std::time::Duration {
         std::time::Duration::from_secs(match self {
@@ -226,6 +235,23 @@ impl CacheRetention {
         match self {
             CacheRetention::Short => serde_json::json!({"type": "ephemeral"}),
             CacheRetention::Long => serde_json::json!({"type": "ephemeral", "ttl": "1h"}),
+        }
+    }
+}
+
+impl fmt::Display for CacheRetention {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for CacheRetention {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "short" | "5m" => Ok(CacheRetention::Short),
+            "long" | "1h" => Ok(CacheRetention::Long),
+            _ => Err(anyhow!("unknown cache retention '{s}' (expected short or long)")),
         }
     }
 }
@@ -408,6 +434,13 @@ impl Settings {
     pub fn save_auto_compaction(enabled: bool) -> Result<()> {
         update_json_object(&settings_path(), |map| {
             object_entry(map, "compaction")?.insert("enabled".into(), Value::Bool(enabled));
+            Ok(())
+        })
+    }
+
+    pub fn save_cache_retention(retention: CacheRetention) -> Result<()> {
+        update_json_object(&settings_path(), |map| {
+            map.insert("cacheRetention".into(), Value::String(retention.to_string()));
             Ok(())
         })
     }
@@ -733,7 +766,7 @@ const BUILTIN_ANTHROPIC: &[BuiltinModel] = &[
         max_tokens: 128_000,
         reasoning: Reasoning::Adaptive,
         levels: ALWAYS_THINKING,
-        cost: cost(2.0, 10.0, 0.20),
+        cost: cost(2.0, 10.0, 0.10),
     },
     BuiltinModel {
         id: "claude-fable-5-1",
@@ -954,7 +987,8 @@ fn resolve_custom_model(provider_name: &str, provider: &ProviderConfig, config: 
         cost: config.cost.or(inherited.map(|b| b.cost)).unwrap_or_default(),
         // Proxies may reject the field; opt in per model.
         eager_input_streaming: config.eager_input_streaming.unwrap_or(false),
-        cache_control: config.cache_control.unwrap_or(inherited.is_some()),
+        // Known Claude models, and anything on the Anthropic Messages API, cache unless told not to.
+        cache_control: config.cache_control.unwrap_or(inherited.is_some() || api == Api::AnthropicMessages),
         budget_url: provider.budget_url.clone(),
     })
 }
@@ -1193,6 +1227,11 @@ mod tests {
         let model = resolve_custom_model("litellm", &provider, &config).unwrap();
         assert_eq!(model.reasoning, Reasoning::None);
         assert!(model.thinking_levels.is_empty());
+        assert!(!model.cache_control);
+
+        // An unknown model on the Anthropic Messages API still caches.
+        let config = ModelConfig { id: "claude-next".into(), ..Default::default() };
+        assert!(resolve_custom_model("litellm", &provider, &config).unwrap().cache_control);
     }
 
     #[test]
@@ -1217,6 +1256,20 @@ mod tests {
         let registry = ModelRegistry::from_models(vec![unusable.clone(), usable]);
         assert_eq!(registry.find("sonnet-5-5").unwrap().provider, "gateway");
         assert!(ensure_credentials(&unusable).unwrap_err().to_string().contains("no API key for provider 'anthropic'"));
+    }
+
+    #[test]
+    fn cache_retention_defaults_to_one_hour() {
+        let mut settings = serde_json::to_value(Settings::default()).unwrap();
+        assert_eq!(settings["cacheRetention"], "long");
+        merge_json(&mut settings, serde_json::json!({"cacheRetention": "short"}));
+        let settings: Settings = serde_json::from_value(settings).unwrap();
+        assert_eq!(settings.cache_retention, CacheRetention::Short);
+
+        assert_eq!(serde_json::from_value::<CacheRetention>(serde_json::json!("5m")).unwrap(), CacheRetention::Short);
+        assert_eq!("1h".parse::<CacheRetention>().unwrap(), CacheRetention::Long);
+        assert_eq!(" Short ".parse::<CacheRetention>().unwrap(), CacheRetention::Short);
+        assert!("forever".parse::<CacheRetention>().is_err());
     }
 
     #[test]

@@ -13,7 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 use crate::agent::{Agent, AgentEvent, QueueMode};
-use crate::config::ThinkingLevel;
+use crate::config::{CacheRetention, ThinkingLevel};
 use crate::message::ContentBlock;
 
 #[derive(Debug, Deserialize)]
@@ -69,6 +69,9 @@ enum Command {
     },
     SetAutoRetry {
         enabled: bool,
+    },
+    SetCacheRetention {
+        retention: CacheRetention,
     },
     Bash {
         command: String,
@@ -257,6 +260,10 @@ fn handle(agent: &Agent, responder: &Responder, id: Option<Value>, name: &str, c
         }
         Command::SetAutoRetry { enabled } => {
             agent.set_auto_retry(enabled);
+            reply(Ok(None));
+        }
+        Command::SetCacheRetention { retention } => {
+            agent.set_cache_retention(retention);
             reply(Ok(None));
         }
         Command::Bash { command, exclude_from_context } => {

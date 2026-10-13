@@ -109,7 +109,7 @@ If your gateway reports the budget elsewhere, set `budgetUrl` on its provider: a
   "hideThinking": false,
   "toolOutputLines": 10,
   "autoUpdate": true,
-  "cacheRetention": "short",
+  "cacheRetention": "long",
   "cacheWarming": "streaming"
 }
 ```
@@ -120,15 +120,15 @@ Picking a model or thinking level in the interactive UI (`/model`, `/thinking`, 
 
 `retry` covers transient API failures (rate limits, overload, server errors, dropped connections), which are retried with exponential backoff as long as no output has streamed yet.
 
-`cacheRetention` and `cacheWarming` control prompt caching for models with `cacheControl` (see [Prompt caching](#prompt-caching)).
+`cacheRetention` and `cacheWarming` control prompt caching for models with `cacheControl` (see [Prompt caching](#prompt-caching)). `/cache long` or `/cache short` changes `cacheRetention` from the interactive UI.
 
 `autoUpdate: false` stops viper from installing new releases itself; it then only says when one is available (see [Updating](install.md#updating)).
 
 ## Prompt caching
 
-For models with `cacheControl` (Claude, directly or through a gateway), each request marks the system prompt and the conversation so far for caching, and the next request reads them from the cache at about a tenth of the input price instead of paying for them again. The footer shows uncached input (↑), output (↓), cache reads (R), and cache writes (W) separately.
+For models with `cacheControl` (on by default for known Claude models, directly or through a gateway, and for any model on the `anthropic-messages` API), each request marks the system prompt, the end of the previous request, and the conversation so far for caching, and the next request reads them from the cache at a tenth of the input price or less instead of paying for them again. The footer shows uncached input (↑), output (↓), cache reads (R), and cache writes (W) separately.
 
-A cache entry expires 5 minutes after it was last used; writing it costs 1.25x the input price. `"cacheRetention": "long"` keeps entries for an hour instead, at 2x the input price per write, which pays off when you often pause for more than a few minutes between messages. Some gateway routes ignore the one-hour lifetime and write five-minute entries; viper sees this in the reported usage, and prices and refreshes those entries as five-minute ones.
+A cache entry expires an hour after it was last used; writing it costs 2x the input price. `"cacheRetention": "short"` (or `/cache short`) keeps entries for 5 minutes instead, at 1.25x the input price per write, which is cheaper when you rarely pause for more than a few minutes between messages. The hour pays off when you step away to wait on a build or test run, since an expired cache means writing the whole conversation again. Some gateway routes ignore the one-hour lifetime and write five-minute entries; viper sees this in the reported usage, and prices and refreshes those entries as five-minute ones.
 
 When a tool call runs longer than the cache lasts, the next request would have to write the whole conversation to the cache again. With `"cacheWarming": "streaming"` (the default), viper refreshes the cache shortly before it expires by repeating the last request with a one-token reply, but only when that is expected to save at least $0.05. Refreshes count toward the session's cost; `"off"` turns them off. They are skipped for models without prices, models that think within a fixed budget, and gateway models with thinking on, whose cache a repeated request might not reuse.
 
