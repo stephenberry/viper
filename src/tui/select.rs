@@ -51,6 +51,21 @@ impl Selector {
         selector
     }
 
+    /// Replace the items, keeping the filter and, while it is still listed, the selected item
+    /// (recognized by its keywords and trimmed label, since column padding may change).
+    pub fn set_items(&mut self, items: Vec<Item>) {
+        let identity = |item: &Item| (item.label.trim_end().to_string(), item.keywords.clone());
+        let selected = self.visible.get(self.selected).map(|index| identity(&self.items[*index]));
+        self.items = items;
+        self.refilter();
+        if let Some(selected) = selected
+            && let Some(row) = self.visible.iter().position(|index| identity(&self.items[*index]) == selected)
+        {
+            self.selected = row;
+        }
+        self.fix_scroll();
+    }
+
     fn refilter(&mut self) {
         let terms: Vec<String> = self.filter.to_lowercase().split_whitespace().map(str::to_string).collect();
         self.visible = (0..self.items.len())
@@ -128,5 +143,41 @@ impl Selector {
         }
         lines.push(dim(&truncate(&self.hint, width)));
         lines
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(label: &str, keywords: &str) -> Item {
+        Item { label: label.into(), keywords: keywords.into(), ..Default::default() }
+    }
+
+    fn selected(selector: &Selector) -> &str {
+        &selector.items[selector.visible[selector.selected]].keywords
+    }
+
+    #[test]
+    fn replacing_items_keeps_the_filter_and_selection() {
+        let items = vec![item("Opus  ", "a/opus"), item("Sonnet", "a/sonnet"), item("Haiku ", "a/haiku")];
+        let mut selector = Selector::new("Model", items, 0, "");
+        selector.handle_key(KeyEvent::from(KeyCode::Char('k')));
+        assert_eq!(selected(&selector), "a/haiku");
+
+        // New items arrive, and padding changes; the filter and the selected item stay.
+        let items = vec![
+            item("Opus", "a/opus"),
+            item("Haiku Next", "b/haiku-next"),
+            item("Sonnet", "a/sonnet"),
+            item("Haiku", "a/haiku"),
+        ];
+        selector.set_items(items);
+        assert_eq!(selector.filter, "k");
+        assert_eq!(selected(&selector), "a/haiku");
+
+        // A selected item that is gone leaves a valid selection.
+        selector.set_items(vec![item("Opus", "a/opus"), item("Haiku Next", "b/haiku-next")]);
+        assert_eq!(selected(&selector), "b/haiku-next");
     }
 }

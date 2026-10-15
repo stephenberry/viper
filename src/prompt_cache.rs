@@ -88,7 +88,7 @@ fn replayable(model: &Model, thinking: ThinkingLevel) -> bool {
 fn expected_savings(model: &Model, retention: CacheRetention, prompt_tokens: u64) -> Option<f64> {
     let prices = PrefixPrices::of(model, retention, prompt_tokens)?;
     let missed = (prices.rewrite - prices.read).max(0.0);
-    let refresh = prices.read + model.cost.output / 1_000_000.0;
+    let refresh = prices.read + model.cost.for_prompt(prompt_tokens).output / 1_000_000.0;
     Some(missed - refresh)
 }
 
@@ -104,7 +104,7 @@ struct PrefixPrices {
 impl PrefixPrices {
     /// `None` when the model has no prices.
     fn of(model: &Model, retention: CacheRetention, tokens: u64) -> Option<PrefixPrices> {
-        let cost = &model.cost;
+        let cost = model.cost.for_prompt(tokens);
         if cost.input <= 0.0 && cost.cache_read <= 0.0 {
             return None;
         }

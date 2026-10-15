@@ -12,7 +12,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{Api, Model, ModelCost, ModelRegistry, models_path, names_builtin_model, update_json_object};
+use crate::config::{
+    Api, LongPromptCost, Model, ModelCost, ModelRegistry, models_path, names_builtin_model, update_json_object,
+};
 use crate::provider::{apply_auth, send, v1_url};
 
 /// A model a server lists, with the metadata it reports.
@@ -76,10 +78,12 @@ async fn list_server_models(client: &reqwest::Client, model: &Model) -> Result<V
 
     let mut models = Vec::new();
     let mut after: Option<String> = None;
+    let url = v1_url(&model.base_url, "models");
     loop {
-        let page = get(v1_url(&model.base_url, "models"), after.clone().map(|id| ("after_id", id)))
+        // HTTP errors do not name the URL, which tells a wrong base URL apart from a bad key.
+        let page = get(url.clone(), after.clone().map(|id| ("after_id", id)))
             .await
-            .context("could not list the server's models")?;
+            .with_context(|| format!("could not list the server's models at {url}"))?;
         models.extend(parse_listing(&page));
         // Anthropic pages its list; OpenAI-compatible servers return everything at once.
         match page.get("last_id").and_then(Value::as_str) {
@@ -123,14 +127,38 @@ fn merge_model_info(models: &mut [ListedModel], info: &Value) {
         model.images = flag("supports_vision").or(model.images);
         model.reasoning = flag("supports_reasoning").or(model.reasoning);
         if let (Some(input), Some(output)) = (number("input_cost_per_token"), number("output_cost_per_token")) {
-            model.cost = Some(ModelCost {
+            let mut cost = ModelCost {
                 input: per_million(input),
                 output: per_million(output),
                 cache_read: number("cache_read_input_token_cost").map_or(0.0, per_million),
                 cache_write: number("cache_creation_input_token_cost").map_or(0.0, per_million),
-            });
+                long_prompt: None,
+            };
+            cost.long_prompt = long_prompt_cost(info, &cost);
+            model.cost = Some(cost);
         }
     }
+}
+
+/// LiteLLM's prices for long prompts, reported under keys such as
+/// `input_cost_per_token_above_200k_tokens`. With several thresholds, the lowest one's prices are
+/// used; prices it does not report stay at `base`.
+fn long_prompt_cost(info: &Value, base: &ModelCost) -> Option<LongPromptCost> {
+    let thousands = info
+        .as_object()?
+        .keys()
+        .filter_map(|key| {
+            key.strip_prefix("input_cost_per_token_above_")?.strip_suffix("k_tokens")?.parse::<u64>().ok()
+        })
+        .min()?;
+    let number = |key: &str| info.get(format!("{key}_above_{thousands}k_tokens")).and_then(Value::as_f64);
+    Some(LongPromptCost {
+        above: thousands * 1_000,
+        input: per_million(number("input_cost_per_token")?),
+        output: number("output_cost_per_token").map_or(base.output, per_million),
+        cache_read: number("cache_read_input_token_cost").map_or(base.cache_read, per_million),
+        cache_write: number("cache_creation_input_token_cost").map_or(base.cache_write, per_million),
+    })
 }
 
 /// A per-token price as dollars per million tokens, without floating-point noise.
@@ -176,6 +204,9 @@ fn model_entry(model: &ListedModel, provider_api: Option<Api>) -> Value {
         }
         if cost.cache_write > 0.0 {
             prices.insert("cacheWrite".into(), json!(cost.cache_write));
+        }
+        if let Some(long) = cost.long_prompt {
+            prices.insert("longPrompt".into(), json!(long));
         }
         entry.insert("cost".into(), Value::Object(prices));
     }
@@ -223,6 +254,7 @@ mod tests {
             {"id": "us.anthropic.claude-opus-5-5", "max_input_tokens": 1000000},
             {"id": "acme.chat-large", "max_input_tokens": 256000, "max_output_tokens": 32000},
             {"id": "acme.tiny"},
+            {"id": "acme.tiered"},
         ]}));
         merge_model_info(
             &mut models,
@@ -237,6 +269,12 @@ mod tests {
                     "max_output_tokens": 128000, "input_cost_per_token": 4.8e-6, "output_cost_per_token": 2.4e-5,
                     "supports_vision": true, "supports_reasoning": true,
                 }},
+                {"model_name": "acme.tiered", "model_info": {
+                    "input_cost_per_token": 1e-6, "output_cost_per_token": 2e-6,
+                    "input_cost_per_token_above_1000k_tokens": 5e-6,
+                    "input_cost_per_token_above_200k_tokens": 3e-6,
+                    "output_cost_per_token_above_200k_tokens": 4e-6,
+                }},
                 {"model_name": "not-listed", "model_info": {"max_input_tokens": 1}},
             ]}),
         );
@@ -246,11 +284,22 @@ mod tests {
     #[test]
     fn listings_merge_litellm_model_info() {
         let models = listing();
-        assert_eq!(models.len(), 3);
+        assert_eq!(models.len(), 4);
         assert_eq!(models[1].context_window, Some(262_144));
         assert_eq!(models[1].max_tokens, Some(32_768));
-        assert_eq!(models[1].cost, Some(ModelCost { input: 0.15, output: 0.528, cache_read: 0.015, cache_write: 0.0 }));
+        assert_eq!(
+            models[1].cost,
+            Some(ModelCost { input: 0.15, output: 0.528, cache_read: 0.015, ..Default::default() })
+        );
         assert_eq!(models[2], ListedModel { id: "acme.tiny".into(), ..Default::default() });
+        // The lowest threshold's prices apply; prices it does not report stay at the usual ones.
+        let long = LongPromptCost { above: 200_000, input: 3.0, output: 4.0, cache_read: 0.0, cache_write: 0.0 };
+        assert_eq!(models[3].cost.unwrap().long_prompt, Some(long));
+        assert_eq!(
+            model_entry(&models[3], Some(Api::OpenAiCompletions))["cost"],
+            json!({"input": 1.0, "output": 2.0,
+                   "longPrompt": {"above": 200000, "input": 3.0, "output": 4.0, "cacheRead": 0.0, "cacheWrite": 0.0}})
+        );
     }
 
     #[test]
@@ -270,6 +319,19 @@ mod tests {
         assert_eq!(model_entry(&models[2], Some(Api::OpenAiCompletions)), json!({"id": "acme.tiny"}));
     }
 
+    #[tokio::test]
+    async fn listing_errors_name_the_url() {
+        use crate::config::ConfigValue;
+        use crate::testing::{MockResponse, MockServer};
+        let server = MockServer::start(vec![MockResponse::error(404, r#"{"error": {"message": "Not Found"}}"#)]).await;
+        let model = Model { api_key: Some(ConfigValue::Literal("k".into())), ..Model::connection("gw", &server.url) };
+        let err = list_server_models(&reqwest::Client::new(), &model).await.unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            format!("could not list the server's models at {}/v1/models: HTTP 404: Not Found", server.url)
+        );
+    }
+
     #[test]
     fn saving_adds_only_new_models() {
         let dir = tempfile::tempdir().unwrap();
@@ -283,13 +345,16 @@ mod tests {
         )
         .unwrap();
         let report = save_models(&path, "gateway", &listing()).unwrap();
-        assert_eq!(report.added, ["us.anthropic.claude-opus-5-5", "acme.chat-large"]);
+        assert_eq!(report.added, ["us.anthropic.claude-opus-5-5", "acme.chat-large", "acme.tiered"]);
         assert_eq!(report.unlisted, ["acme.retired"]);
 
         let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let models = saved["providers"]["gateway"]["models"].as_array().unwrap();
         let ids: Vec<&str> = models.iter().map(|m| m["id"].as_str().unwrap()).collect();
-        assert_eq!(ids, ["acme.tiny", "acme.retired", "us.anthropic.claude-opus-5-5", "acme.chat-large"]);
+        assert_eq!(
+            ids,
+            ["acme.tiny", "acme.retired", "us.anthropic.claude-opus-5-5", "acme.chat-large", "acme.tiered"]
+        );
         assert_eq!(models[0]["name"], "Tiny");
 
         // A second sync finds nothing new.

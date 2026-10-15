@@ -13,7 +13,7 @@ mod style;
 mod terminal;
 mod text;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -85,10 +85,19 @@ enum AppMsg {
     BashUpdate(String),
     BashDone(Result<BashExecutionMessage>),
     LoginChecked(Box<CheckedLogin>),
-    ModelsSynced(String, Result<SyncReport>),
+    ModelsSynced { provider: String, trigger: SyncTrigger, result: Result<SyncReport> },
     Budget(String, Result<crate::budget::Budget>),
     FileIndex(Arc<file_index::FileIndex>),
     Update(crate::update::Outcome),
+}
+
+/// Why a model sync runs, which decides how much of its outcome is reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncTrigger {
+    /// `/sync-models` or a first `/login`: report progress and every outcome.
+    Requested,
+    /// Opening the model selector: report only added models, and failures only in passing.
+    Background,
 }
 
 enum StreamKind {
@@ -170,6 +179,9 @@ struct App {
     bash_live: Option<(String, String)>,
     queued: (Vec<String>, Vec<String>),
     overlay: Option<Overlay>,
+    /// Providers whose models were synced this session; opening the model selector syncs each
+    /// of the others once.
+    synced_providers: HashSet<String>,
     suggestion: usize,
     notice: Option<String>,
     spinner: usize,
@@ -260,7 +272,16 @@ fn format_prices(cost: &crate::config::ModelCost) -> Option<String> {
         let text = format!("{price:.2}");
         format!("${}", text.trim_end_matches('0').trim_end_matches('.'))
     };
-    Some(format!("{} in · {} out /1M", dollars(cost.input), dollars(cost.output)))
+    let mut text = format!("{} in · {} out /1M", dollars(cost.input), dollars(cost.output));
+    if let Some(long) = cost.long_prompt {
+        text.push_str(&format!(
+            " ({} · {} over {})",
+            dollars(long.input),
+            dollars(long.output),
+            format_tokens(long.above).to_uppercase()
+        ));
+    }
+    Some(text)
 }
 
 /// The warning under the input while the prompt cache has expired.
@@ -325,6 +346,7 @@ impl App {
             bash_live: None,
             queued: (Vec::new(), Vec::new()),
             overlay: None,
+            synced_providers: HashSet::new(),
             suggestion: 0,
             notice: None,
             spinner: 0,
@@ -823,21 +845,7 @@ impl App {
                 self.refresh_footer();
             }
             AppMsg::LoginChecked(login) => self.finish_login(*login),
-            AppMsg::ModelsSynced(provider, result) => {
-                self.notice = None;
-                match result.and_then(|report| Ok((report, ModelRegistry::load()?))) {
-                    Ok((report, registry)) => {
-                        self.agent.set_registry(registry);
-                        self.notice(&report.describe(&provider));
-                        // Still on a model without a key: offer the models that can be used now.
-                        if self.overlay.is_none() && !has_credentials(&self.agent.model()) {
-                            self.open_model_selector();
-                        }
-                    }
-                    Err(err) => self.error(&format!("Could not sync {provider}'s models: {err:#}")),
-                }
-                self.refresh_footer();
-            }
+            AppMsg::ModelsSynced { provider, trigger, result } => self.finish_model_sync(&provider, trigger, result),
             AppMsg::FileIndex(index) => {
                 self.file_index = Some(index);
                 self.update_file_completion();
@@ -1476,20 +1484,66 @@ impl App {
         if provider.is_empty() || provider.contains(char::is_whitespace) {
             bail!("Usage: /sync-models <provider> (configured: {})", self.agent.registry().providers().join(", "));
         }
-        self.spawn_model_sync(provider);
+        self.spawn_model_sync(provider, SyncTrigger::Requested);
         Ok(())
     }
 
     /// Add the models `provider`'s server offers to models.json in the background; the result
     /// arrives as `AppMsg::ModelsSynced`.
-    fn spawn_model_sync(&mut self, provider: &str) {
-        self.notice = Some(format!("Listing the models {provider} offers…"));
+    fn spawn_model_sync(&mut self, provider: &str, trigger: SyncTrigger) {
+        if trigger == SyncTrigger::Requested {
+            self.notice = Some(format!("Listing the models {provider} offers…"));
+        }
+        self.synced_providers.insert(provider.to_string());
         let registry = self.agent.registry();
         let (client, tx, provider) = (self.agent.http_client().clone(), self.app_tx.clone(), provider.to_string());
         tokio::spawn(async move {
             let result = crate::model_sync::sync(&client, &registry, &provider).await;
-            let _ = tx.send(AppMsg::ModelsSynced(provider, result));
+            let _ = tx.send(AppMsg::ModelsSynced { provider, trigger, result });
         });
+    }
+
+    /// Sync, in the background, each models.json provider with credentials that has not been
+    /// synced this session, so the model selector offers models a gateway gained since `/login`.
+    /// The built-in Anthropic models are a curated list and are not synced.
+    fn sync_providers_in_background(&mut self) {
+        let registry = self.agent.registry();
+        let providers: Vec<String> = registry
+            .providers()
+            .into_iter()
+            .filter(|provider| *provider != "anthropic" && !self.synced_providers.contains(*provider))
+            .filter(|provider| registry.provider_model(provider).is_some_and(has_credentials))
+            .map(str::to_string)
+            .collect();
+        for provider in providers {
+            self.spawn_model_sync(&provider, SyncTrigger::Background);
+        }
+    }
+
+    fn finish_model_sync(&mut self, provider: &str, trigger: SyncTrigger, result: Result<SyncReport>) {
+        let background = trigger == SyncTrigger::Background;
+        if background && result.as_ref().is_ok_and(|report| report.added.is_empty()) {
+            return;
+        }
+        if !background {
+            self.notice = None;
+        }
+        match result.and_then(|report| Ok((report, ModelRegistry::load()?))) {
+            Ok((report, registry)) => {
+                self.agent.set_registry(registry);
+                self.refresh_model_selector();
+                // A background sync interrupts only to announce new models.
+                let report = if background { SyncReport { unlisted: Vec::new(), ..report } } else { report };
+                self.notice(&report.describe(provider));
+                // Still on a model without a key: offer the models that can be used now.
+                if self.overlay.is_none() && !has_credentials(&self.agent.model()) {
+                    self.open_model_selector();
+                }
+            }
+            Err(err) if background => self.notice = Some(format!("Could not refresh {provider}'s models: {err:#}")),
+            Err(err) => self.error(&format!("Could not sync {provider}'s models: {err:#}")),
+        }
+        self.refresh_footer();
     }
 
     /// `/login <provider>`: ask for the base URL and API key, check the key, and save it.
@@ -1621,7 +1675,7 @@ impl App {
             _ => self.warning(&text),
         }
         if sync {
-            self.spawn_model_sync(&login.provider);
+            self.spawn_model_sync(&login.provider, SyncTrigger::Requested);
         }
         self.refresh_footer();
     }
@@ -1694,6 +1748,26 @@ impl App {
     }
 
     fn open_model_selector(&mut self) {
+        let (items, models, initial) = self.model_selector_entries();
+        self.overlay =
+            Some(Overlay::Model(Selector::new("Model", items, initial, "↑↓ select · enter use · esc cancel"), models));
+        self.sync_providers_in_background();
+    }
+
+    /// Show the current models in the open model selector, keeping its filter and selection.
+    fn refresh_model_selector(&mut self) {
+        if !matches!(self.overlay, Some(Overlay::Model(..))) {
+            return;
+        }
+        let (items, models, _) = self.model_selector_entries();
+        if let Some(Overlay::Model(selector, shown)) = &mut self.overlay {
+            selector.set_items(items);
+            *shown = models;
+        }
+    }
+
+    /// The model selector's items, the models they stand for, and the current model's index.
+    fn model_selector_entries(&self) -> (Vec<Item>, Vec<crate::config::Model>, usize) {
         let current = self.agent.model().key();
         // Models without credentials are listed only when nothing is usable, to explain why.
         let registry = &self.agent.registry();
@@ -1720,8 +1794,7 @@ impl App {
             })
             .collect();
         let initial = models.iter().position(|m| m.key() == current).unwrap_or(0);
-        self.overlay =
-            Some(Overlay::Model(Selector::new("Model", items, initial, "↑↓ select · enter use · esc cancel"), models));
+        (items, models, initial)
     }
 
     fn open_thinking_selector(&mut self) {
@@ -1989,6 +2062,9 @@ mod tests {
         assert_eq!(format_prices(&cost(0.15, 0.528)).as_deref(), Some("$0.15 in · $0.53 out /1M"));
         assert_eq!(format_prices(&cost(2.5, 10.0)).as_deref(), Some("$2.5 in · $10 out /1M"));
         assert_eq!(format_prices(&cost(0.0, 0.0)), None);
+
+        let haiku = crate::config::builtin_anthropic_models().into_iter().find(|m| m.id == "claude-haiku-5-5").unwrap();
+        assert_eq!(format_prices(&haiku.cost).as_deref(), Some("$0.1 in · $0.5 out /1M ($0.5 · $2.5 over 100K)"));
     }
 
     #[test]

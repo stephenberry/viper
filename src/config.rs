@@ -99,11 +99,15 @@ fn read_json_file(path: &Path) -> Result<Option<Value>> {
 }
 
 /// Update the JSON object in `path`, keeping whatever `update` leaves alone. A missing file
-/// starts as `{}`.
+/// starts as `{}`. Updates run one at a time, so background tasks (such as model syncs) that
+/// update the same file do not overwrite each other's changes.
 pub(crate) fn update_json_object(
     path: &Path,
     update: impl FnOnce(&mut Map<String, Value>) -> Result<()>,
 ) -> Result<()> {
+    static UPDATES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // The guarded data is the file, which a panicked update leaves intact or unwritten.
+    let _guard = UPDATES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut value = read_json_file(path)?.unwrap_or_else(|| Value::Object(Map::new()));
     let Value::Object(map) = &mut value else {
         bail!("{} must contain a JSON object", path.display());
@@ -513,6 +517,37 @@ pub struct ModelCost {
     pub output: f64,
     pub cache_read: f64,
     pub cache_write: f64,
+    /// Prices for the whole request when its prompt is longer than a threshold.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub long_prompt: Option<LongPromptCost>,
+}
+
+/// Prices in dollars per million tokens that replace a model's usual prices for a request whose
+/// prompt (input, cache reads, and cache writes) is longer than `above` tokens.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LongPromptCost {
+    pub above: u64,
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
+}
+
+impl ModelCost {
+    /// The prices charged for a request whose prompt is `prompt_tokens` long.
+    pub fn for_prompt(&self, prompt_tokens: u64) -> ModelCost {
+        match self.long_prompt {
+            Some(long) if prompt_tokens > long.above => ModelCost {
+                input: long.input,
+                output: long.output,
+                cache_read: long.cache_read,
+                cache_write: long.cache_write,
+                long_prompt: None,
+            },
+            _ => ModelCost { long_prompt: None, ..*self },
+        }
+    }
 }
 
 /// A fully resolved model, ready to be called.
@@ -609,13 +644,14 @@ impl Model {
 
     pub fn compute_cost(&self, usage: &mut crate::message::Usage) {
         let per = |tokens: u64, price: f64| tokens as f64 * price / 1_000_000.0;
-        usage.cost.input = per(usage.input, self.cost.input);
-        usage.cost.output = per(usage.output, self.cost.output);
-        usage.cost.cache_read = per(usage.cache_read, self.cost.cache_read);
+        let cost = self.cost.for_prompt(usage.input + usage.cache_read + usage.cache_write);
+        usage.cost.input = per(usage.input, cost.input);
+        usage.cost.output = per(usage.output, cost.output);
+        usage.cost.cache_read = per(usage.cache_read, cost.cache_read);
         // One-hour cache writes cost twice the input price; five-minute writes cost `cacheWrite`.
         let long_writes = usage.cache_write_1h.unwrap_or(0).min(usage.cache_write);
         usage.cost.cache_write =
-            per(usage.cache_write - long_writes, self.cost.cache_write) + per(long_writes, self.cost.input * 2.0);
+            per(usage.cache_write - long_writes, cost.cache_write) + per(long_writes, cost.input * 2.0);
         usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cache_read + usage.cost.cache_write;
     }
 }
@@ -746,7 +782,19 @@ const BUDGET_THINKING: &[ThinkingLevel] = &[Off, Minimal, Low, Medium, High];
 
 const fn cost(input: f64, output: f64, cache_read: f64) -> ModelCost {
     // Five-minute cache writes cost 1.25x the input price.
-    ModelCost { input, output, cache_read, cache_write: input * 1.25 }
+    ModelCost { input, output, cache_read, cache_write: input * 1.25, long_prompt: None }
+}
+
+/// `base` prices, replaced by `long` prices for prompts longer than `above` tokens.
+const fn tiered_cost(base: ModelCost, above: u64, long: ModelCost) -> ModelCost {
+    let long_prompt = LongPromptCost {
+        above,
+        input: long.input,
+        output: long.output,
+        cache_read: long.cache_read,
+        cache_write: long.cache_write,
+    };
+    ModelCost { long_prompt: Some(long_prompt), ..base }
 }
 
 const BUILTIN_ANTHROPIC: &[BuiltinModel] = &[
@@ -767,6 +815,15 @@ const BUILTIN_ANTHROPIC: &[BuiltinModel] = &[
         reasoning: Reasoning::Adaptive,
         levels: ALWAYS_THINKING,
         cost: cost(2.0, 10.0, 0.10),
+    },
+    BuiltinModel {
+        id: "claude-haiku-5-5",
+        name: "Claude Haiku 5.5",
+        context_window: 1_000_000,
+        max_tokens: 128_000,
+        reasoning: Reasoning::Adaptive,
+        levels: OPTIONAL_THINKING,
+        cost: tiered_cost(cost(0.10, 0.50, 0.01), 100_000, cost(0.50, 2.50, 0.05)),
     },
     BuiltinModel {
         id: "claude-fable-5-1",
@@ -1232,6 +1289,44 @@ mod tests {
         // An unknown model on the Anthropic Messages API still caches.
         let config = ModelConfig { id: "claude-next".into(), ..Default::default() };
         assert!(resolve_custom_model("litellm", &provider, &config).unwrap().cache_control);
+    }
+
+    #[test]
+    fn long_prompts_use_long_prompt_prices() {
+        let haiku = builtin_anthropic_models().into_iter().find(|m| m.id == "claude-haiku-5-5").unwrap();
+        assert_eq!((haiku.context_window, haiku.reasoning), (1_000_000, Reasoning::Adaptive));
+        let cost = |input: u64, cache_read: u64, cache_write: u64| {
+            let mut usage =
+                crate::message::Usage { input, output: 1_000_000, cache_read, cache_write, ..Default::default() };
+            haiku.compute_cost(&mut usage);
+            usage.cost
+        };
+        // A prompt of exactly 100k tokens is billed at the usual prices.
+        let short = cost(40_000, 50_000, 10_000);
+        assert!((short.input - 0.004).abs() < 1e-12 && (short.output - 0.5).abs() < 1e-12, "{short:?}");
+        assert!((short.cache_read - 0.0005).abs() < 1e-12, "{short:?}");
+        assert!((short.cache_write - 0.00125).abs() < 1e-12, "{short:?}");
+        // Cache reads and writes count toward the prompt, so one more token switches every price.
+        let long = cost(40_001, 50_000, 10_000);
+        assert!((long.input - 0.0200005).abs() < 1e-12 && (long.output - 2.5).abs() < 1e-12, "{long:?}");
+        assert!((long.cache_read - 0.0025).abs() < 1e-12, "{long:?}");
+        assert!((long.cache_write - 0.00625).abs() < 1e-12, "{long:?}");
+    }
+
+    #[test]
+    fn models_json_prices_long_prompts() {
+        let cost: ModelCost = serde_json::from_value(serde_json::json!({
+            "input": 1.0, "output": 2.0, "longPrompt": {"above": 200000, "input": 3.0, "output": 4.0}
+        }))
+        .unwrap();
+        assert_eq!(cost.for_prompt(200_000), ModelCost { input: 1.0, output: 2.0, ..Default::default() });
+        assert_eq!(cost.for_prompt(200_001), ModelCost { input: 3.0, output: 4.0, ..Default::default() });
+
+        // Gateway entries named after Claude Haiku 5.5 inherit its long-prompt prices.
+        let provider = ProviderConfig { base_url: Some("http://localhost:4000".into()), ..Default::default() };
+        let config = ModelConfig { id: "us.anthropic.claude-haiku-5-5".into(), ..Default::default() };
+        let model = resolve_custom_model("litellm", &provider, &config).unwrap();
+        assert_eq!(model.cost.long_prompt.map(|long| long.above), Some(100_000));
     }
 
     #[test]

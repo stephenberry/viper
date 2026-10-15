@@ -67,13 +67,15 @@ Models are identified as `provider/id`. To list the same gateway model twice (fo
 
 ### Syncing models
 
-`/sync-models <provider>` (or `viper --sync-models <provider>`) lists the server's models (`GET /v1/models`) and adds the ones `models.json` does not have yet. With LiteLLM, each new entry also gets the context window, output limit, prices, and image and reasoning support that the gateway reports. Models named after a built-in Claude model keep the provider's `api` and inherit the rest; other models use `openai-completions`. Existing entries are never changed, and configured models the server no longer lists are only reported.
+`/sync-models <provider>` (or `viper --sync-models <provider>`) lists the server's models (`GET /v1/models`) and adds the ones `models.json` does not have yet. With LiteLLM, each new entry also gets the context window, output limit, prices, and image and reasoning support that the gateway reports. Models named after a built-in Claude model keep the provider's `api` and inherit the rest; other models use `openai-completions`. Existing entries are never changed, and configured models the server no longer lists are only reported. LiteLLM's higher prices for long prompts (`…_above_200k_tokens`) become `longPrompt`.
+
+Opening the model selector (`/model` or **Ctrl+L**) also syncs, in the background, each provider with an API key that has not been synced this session, so models a gateway gains after `/login` appear without running `/sync-models`. The selector opens right away and lists new models when they arrive; a failed sync shows a short notice. The built-in `anthropic` models are not synced this way.
 
 ### Fields
 
 **Provider:** `baseUrl`, `apiKey`, `api` (`anthropic-messages` or `openai-completions`), `authHeader` (`bearer`, the default for custom providers, or `xapikey`), `headers`, `budgetUrl` (see [Budgets](#budgets)).
 
-**Model:** `id`, `alias`, `name`, `base`, `api`, `contextWindow`, `maxTokens`, `reasoning` (`adaptive`, `budget`, `effort`, `none`), `thinkingLevels`, `images`, `cost` (`input`, `output`, `cacheRead`, `cacheWrite` in dollars per million tokens), `cacheControl`, `eagerInputStreaming`, `headers`, and `extraBody` (fields merged into every request body).
+**Model:** `id`, `alias`, `name`, `base`, `api`, `contextWindow`, `maxTokens`, `reasoning` (`adaptive`, `budget`, `effort`, `none`), `thinkingLevels`, `images`, `cost` (`input`, `output`, `cacheRead`, `cacheWrite` in dollars per million tokens, plus an optional `longPrompt` with the same fields and `above`: the prompt length in tokens past which its prices apply to the whole request), `cacheControl`, `eagerInputStreaming`, `headers`, and `extraBody` (fields merged into every request body).
 
 ## Budgets
 
