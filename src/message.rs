@@ -4,6 +4,8 @@
 //! request. The serialized form (camelCase, tagged by `role` / `type`) is also the session file and
 //! JSON/RPC event format.
 
+use std::ops::Range;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -127,12 +129,20 @@ impl Usage {
 #[serde(rename_all = "camelCase")]
 pub struct UserMessage {
     pub content: Vec<ContentBlock>,
+    /// Byte ranges of the first content block's text that were pasted, shown collapsed in the
+    /// transcript. Display only; the model sees the full text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pastes: Vec<Range<usize>>,
     pub timestamp: i64,
 }
 
 impl UserMessage {
     pub fn new(content: Vec<ContentBlock>) -> Self {
-        Self { content, timestamp: now_ms() }
+        Self { content, pastes: Vec::new(), timestamp: now_ms() }
+    }
+
+    pub fn text(&self) -> String {
+        content_text(&self.content)
     }
 }
 

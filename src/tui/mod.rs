@@ -30,10 +30,10 @@ use crate::auth::{AuthStore, auth_path};
 use crate::config::{
     CacheRetention, Model, ModelRegistry, Settings, ThinkingLevel, has_credentials, parse_auto_compact_window,
 };
-use crate::message::{BashExecutionMessage, ContentBlock, Message, StopReason};
+use crate::message::{BashExecutionMessage, ContentBlock, Message, StopReason, UserMessage};
 use crate::model_sync::SyncReport;
 use crate::provider::{CredentialCheck, StreamDelta};
-use editor::Editor;
+use editor::{Draft, Editor};
 use markdown::MarkdownRenderer;
 use prompt::{PromptAction, TextPrompt};
 use render::{Line, ToolState};
@@ -75,6 +75,7 @@ const HOTKEYS: &[(&str, &str)] = &[
     ("Ctrl+O", "expand/collapse tool output for new output"),
     ("Ctrl+G", "edit the prompt in $VISUAL / $EDITOR"),
     ("Ctrl+V", "paste an image from the clipboard"),
+    ("Ctrl+P", "expand a collapsed paste into editable text"),
     ("Tab", "complete commands and paths"),
     ("Up/Down", "move between lines; browse history at the edges"),
     ("!cmd / !!cmd", "run a shell command (!! keeps output out of context)"),
@@ -177,6 +178,7 @@ struct App {
     file_completion_dismissed: Option<(usize, String)>,
     status: Option<String>,
     bash_live: Option<(String, String)>,
+    /// Previews of the queued steering and follow-up messages.
     queued: (Vec<String>, Vec<String>),
     overlay: Option<Overlay>,
     /// Providers whose models were synced this session; opening the model selector syncs each
@@ -200,25 +202,73 @@ fn history_path() -> PathBuf {
     crate::config::agent_dir().join("history.jsonl")
 }
 
-fn load_history() -> Vec<String> {
+/// A prompt history line: plain text, or a draft with collapsed pastes.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum HistoryEntry {
+    Text(String),
+    Draft(Draft),
+}
+
+fn load_history() -> Vec<Draft> {
     let Ok(text) = std::fs::read_to_string(history_path()) else { return Vec::new() };
-    let mut entries: Vec<String> = text.lines().filter_map(|l| serde_json::from_str::<String>(l).ok()).collect();
+    let mut entries = parse_history(&text);
     let excess = entries.len().saturating_sub(1000);
     entries.drain(..excess);
     entries
 }
 
-fn append_history(entry: &str) {
+/// Read history lines, skipping any that are malformed.
+fn parse_history(text: &str) -> Vec<Draft> {
+    text.lines()
+        .filter_map(|line| match serde_json::from_str(line).ok()? {
+            HistoryEntry::Text(text) => Some(Draft::plain(text)),
+            HistoryEntry::Draft(draft) => draft.is_consistent().then_some(draft),
+        })
+        .collect()
+}
+
+/// A draft as a history line; plain text when it has no pastes.
+fn history_line(draft: &Draft) -> serde_json::Result<String> {
+    if draft.pastes.is_empty() { serde_json::to_string(&draft.text) } else { serde_json::to_string(draft) }
+}
+
+fn append_history(draft: &Draft) {
     use std::io::Write;
     let path = history_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path)
-        && let Ok(line) = serde_json::to_string(entry)
+        && let Ok(line) = history_line(draft)
     {
         let _ = writeln!(file, "{line}");
     }
+}
+
+/// A queued message as a draft: its typed text with pastes collapsed. Files attached by `@`
+/// mentions are left out, since the mentions in the text attach them again when it is sent.
+fn queued_draft(message: &UserMessage) -> Draft {
+    match message.content.first() {
+        Some(ContentBlock::Text { text }) if crate::mentions::attachment_name(text).is_none() => {
+            Draft::collapse(text, &message.pastes)
+        }
+        _ => Draft::default(),
+    }
+}
+
+/// The editor's top or bottom border, noting how many rows are scrolled out of view past it.
+fn editor_border(color: &str, width: usize, hidden: usize, arrow: char) -> String {
+    let note = match hidden {
+        0 => String::new(),
+        1 => format!(" {arrow} 1 more row "),
+        n => format!(" {arrow} {n} more rows "),
+    };
+    let note_width = visible_width(&note);
+    if note.is_empty() || note_width + 2 > width {
+        return format!("{color}{}{RESET}", "─".repeat(width));
+    }
+    format!("{color}──{RESET}{GRAY}{note}{RESET}{color}{}{RESET}", "─".repeat(width - note_width - 2))
 }
 
 fn git_branch(cwd: &Path) -> Option<String> {
@@ -564,9 +614,8 @@ impl App {
         }
 
         let border_color = thinking_color(self.agent.thinking());
-        let border = format!("{border_color}{}{RESET}", "─".repeat(width));
-
         if let Some(overlay) = &self.overlay {
+            let border = format!("{border_color}{}{RESET}", "─".repeat(width));
             lines.push(border.clone());
             let mut cursor = None;
             match overlay {
@@ -589,13 +638,17 @@ impl App {
             lines
                 .push(format!("{CYAN}{}{RESET} {GRAY}(backspace on an empty prompt removes){RESET}", labels.join(" ")));
         }
-        lines.push(border.clone());
+        // The screen shows `height - 1` live lines; keep the borders, at least one editor row, and
+        // what follows the editor on screen, and give the editor at most half the terminal.
+        let height = terminal::size().1;
+        let below = self.below_editor(width, height.saturating_sub(4).max(1));
+        let room = height.saturating_sub(below.len() + 3).min(height / 2).max(1);
         let content_width = width.saturating_sub(2).max(4);
-        let rows = self.editor.rows(content_width);
-        let (cursor_row, cursor_col) = self.editor.cursor_position(content_width);
+        let view = self.editor.view(content_width, room);
+        lines.push(editor_border(border_color, width, view.above, '↑'));
         let editor_top = lines.len();
-        for (i, row) in rows.iter().enumerate() {
-            let prefix = if i == 0 { render::PROMPT_PREFIX } else { "  " };
+        for (i, row) in view.rows.iter().enumerate() {
+            let prefix = if i == 0 && view.above == 0 { render::PROMPT_PREFIX } else { "  " };
             lines.push(format!("{prefix}{row}"));
         }
         if self.editor.is_empty() {
@@ -607,31 +660,45 @@ impl App {
             lines[editor_top] =
                 format!("{}{GRAY}{}{RESET}", render::PROMPT_PREFIX, truncate(placeholder, content_width));
         }
-        lines.push(border);
+        lines.push(editor_border(border_color, width, view.below, '↓'));
+        lines.extend(below);
+        (lines, Some((editor_top + view.cursor.0, view.cursor.1 + 2)))
+    }
+
+    /// Completions or the footer, shown under the editor in at most `limit` lines.
+    fn below_editor(&self, width: usize, limit: usize) -> Vec<String> {
         let suggestions = self.suggestions();
-        if let Some(completion) = &self.file_completion {
+        let (lines, selected): (Vec<String>, usize) = if let Some(completion) = &self.file_completion {
             let selected = self.suggestion.min(completion.matches.len() - 1);
-            for (i, (path, _)) in completion.matches.iter().enumerate() {
+            let lines = completion.matches.iter().enumerate().map(|(i, (path, _))| {
                 let line = if i == selected { format!("{CYAN}{BOLD}@{path}{RESET}") } else { format!("@{path}") };
-                lines.push(truncate(&line, width));
-            }
+                truncate(&line, width)
+            });
+            (lines.collect(), selected)
         } else if suggestions.is_empty() {
-            if let Some(hint) = self.stale_cache_hint.as_ref().filter(|_| busy.is_none()) {
+            let mut lines = Vec::new();
+            if limit > 1
+                && let Some(hint) = self.stale_cache_hint.as_ref().filter(|_| self.agent.busy().is_none())
+            {
                 lines.push(paint(YELLOW, &truncate(hint, width)));
             }
             lines.push(self.footer_line(width));
+            return lines;
         } else {
             let selected = self.suggestion.min(suggestions.len() - 1);
-            for (i, (name, desc)) in suggestions.iter().enumerate().take(8) {
+            let lines = suggestions.iter().enumerate().take(8).map(|(i, (name, desc))| {
                 let line = if i == selected {
                     format!("{CYAN}{BOLD}{name}{RESET}  {GRAY}{desc}{RESET}")
                 } else {
                     format!("{name}  {GRAY}{desc}{RESET}")
                 };
-                lines.push(truncate(&line, width));
-            }
-        }
-        (lines, Some((editor_top + cursor_row, cursor_col + 2)))
+                truncate(&line, width)
+            });
+            (lines.collect(), selected)
+        };
+        // On a short terminal, show the part of the list that holds the selection.
+        let first = (selected + 1).saturating_sub(limit);
+        lines.into_iter().skip(first).take(limit).collect()
     }
 
     fn draw(&mut self) -> Result<()> {
@@ -748,7 +815,7 @@ impl App {
             AgentEvent::MessageStart { message } => match &message {
                 Message::User(user) => {
                     self.gap();
-                    self.commit(render::user_lines(&user.content));
+                    self.commit(render::user_lines(user));
                 }
                 Message::Assistant(_) => self.blocks.clear(),
                 _ => {}
@@ -821,7 +888,13 @@ impl App {
                 self.status = Some(format!("Retrying in {:.0}s ({attempt}/{max_attempts})", delay_ms as f64 / 1000.0));
                 self.notice(&format!("{} — retrying ({attempt}/{max_attempts})", sanitize(&error_message)));
             }
-            AgentEvent::QueueUpdate { steering, follow_up } => self.queued = (steering, follow_up),
+            // The event carries the full text; previews come from the queue itself so that pastes
+            // and attached files stay collapsed.
+            AgentEvent::QueueUpdate { .. } => {
+                let (steering, follow_up) = self.agent.queued();
+                let previews = |messages: Vec<UserMessage>| messages.iter().map(|m| queued_draft(m).text).collect();
+                self.queued = (previews(steering), previews(follow_up));
+            }
             AgentEvent::CacheWarm { .. } => self.refresh_footer(),
         }
     }
@@ -902,7 +975,12 @@ impl App {
                         Err(err) => self.notice = Some(format!("Could not attach {}: {err:#}", path.display())),
                     }
                 } else {
-                    self.editor.insert(&text.replace("\r\n", "\n").replace('\r', "\n"));
+                    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                    if editor::should_collapse(&text) {
+                        self.editor.insert_paste(text);
+                    } else {
+                        self.editor.insert(&text);
+                    }
                     self.update_file_completion();
                 }
             }
@@ -984,13 +1062,7 @@ impl App {
             KeyCode::Esc => {
                 if self.agent.busy().is_some() {
                     let restored = self.agent.abort();
-                    if !restored.is_empty() {
-                        let mut text = restored.join("\n\n");
-                        if !self.editor.is_empty() {
-                            text = format!("{text}\n\n{}", self.editor.text());
-                        }
-                        self.editor.set_text(&text);
-                    }
+                    self.restore_queued(restored);
                 } else if !suggestions.is_empty() {
                     self.editor.take();
                 }
@@ -1026,15 +1098,18 @@ impl App {
             }
             KeyCode::Char('g') if ctrl => self.external_editor()?,
             KeyCode::Char('v') if ctrl => self.paste_clipboard_image(),
+            KeyCode::Char('p') if ctrl => {
+                if !self.editor.expand_paste() {
+                    self.notice = Some(if self.editor.has_pastes() {
+                        "Move the cursor next to a collapsed paste to expand it".into()
+                    } else {
+                        "No collapsed paste to expand".into()
+                    });
+                }
+            }
             KeyCode::Up if alt => {
                 let (steering, follow_up) = self.agent.clear_queue();
-                let mut parts: Vec<String> = steering.into_iter().chain(follow_up).collect();
-                if !parts.is_empty() {
-                    if !self.editor.is_empty() {
-                        parts.push(self.editor.text().to_string());
-                    }
-                    self.editor.set_text(&parts.join("\n\n"));
-                }
+                self.restore_queued(steering.into_iter().chain(follow_up).collect());
             }
             KeyCode::Up => {
                 if !suggestions.is_empty() {
@@ -1136,6 +1211,24 @@ impl App {
         }
     }
 
+    /// Put queued messages back into the editor, ahead of what it holds.
+    fn restore_queued(&mut self, messages: Vec<UserMessage>) {
+        let mut restored = Draft::default();
+        for draft in messages.iter().map(queued_draft).filter(|draft| !draft.text.is_empty()) {
+            if !restored.text.is_empty() {
+                restored.append(Draft::plain("\n\n"));
+            }
+            restored.append(draft);
+        }
+        if restored.text.is_empty() {
+            return;
+        }
+        if !self.editor.is_empty() {
+            restored.append(Draft::plain("\n\n"));
+        }
+        self.editor.prepend(restored);
+    }
+
     fn paste_clipboard_image(&mut self) {
         let result = arboard::Clipboard::new()
             .and_then(|mut clipboard| clipboard.get_image())
@@ -1152,7 +1245,8 @@ impl App {
     fn external_editor(&mut self) -> Result<()> {
         let editor = std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")).unwrap_or_else(|_| "vi".into());
         let path = std::env::temp_dir().join(format!("viper-prompt-{}.md", uuid::Uuid::new_v4().simple()));
-        std::fs::write(&path, self.editor.text())?;
+        let written = self.editor.snapshot().expanded();
+        std::fs::write(&path, &written)?;
         self.screen.clear()?;
         self.guard.suspend()?;
         let status = tokio::task::block_in_place(|| {
@@ -1162,7 +1256,10 @@ impl App {
         match status {
             Ok(status) if status.success() => {
                 let text = std::fs::read_to_string(&path).unwrap_or_default();
-                self.editor.set_text(text.trim_end_matches('\n'));
+                // Unchanged text keeps its pastes collapsed.
+                if text.trim_end_matches('\n') != written.trim_end_matches('\n') {
+                    self.editor.set_text(text.trim_end_matches('\n'));
+                }
             }
             Ok(status) => self.notice = Some(format!("Editor exited with {status}")),
             Err(err) => self.notice = Some(format!("Could not run {editor}: {err}")),
@@ -1172,13 +1269,15 @@ impl App {
     }
 
     fn submit(&mut self, queue: Option<QueueMode>) -> Result<()> {
-        let text = self.editor.text().trim_end().to_string();
+        let mut draft = self.editor.snapshot();
+        draft.trim_end();
+        let (text, pastes) = draft.expand_trimmed();
         if text.trim().is_empty() && self.attachments.is_empty() {
             return Ok(());
         }
         self.editor.take();
-        self.editor.push_history(&text);
-        append_history(&text);
+        self.editor.push_history(&draft);
+        append_history(&draft);
 
         if let Some(rest) = text.strip_prefix('/') {
             let name = rest.split_whitespace().next().unwrap_or("");
@@ -1196,7 +1295,7 @@ impl App {
                 return Ok(());
             }
             if self.agent.busy().is_some() {
-                self.editor.set_text(&text);
+                self.editor.set_draft(draft);
                 self.notice = Some("Wait for the agent to finish (or press Esc) before running a command".into());
                 return Ok(());
             }
@@ -1217,14 +1316,17 @@ impl App {
         let mut attachments = match crate::mentions::attachments(&text, self.agent.cwd()) {
             Ok(files) => files,
             Err(err) => {
-                self.editor.set_text(&text);
+                self.editor.set_draft(draft);
                 return Err(err);
             }
         };
         attachments.append(&mut self.attachments);
         let content = crate::agent::user_content(&text, attachments);
         let content = crate::modes::expand_skill(&self.agent, content)?;
-        self.agent.prompt(content, queue)?;
+        // A skill command rewrites the text, which moves the pastes.
+        let unchanged = matches!(content.first(), Some(ContentBlock::Text { text: sent }) if *sent == text);
+        let pastes = if unchanged { pastes } else { Vec::new() };
+        self.agent.prompt_message(UserMessage { pastes, ..UserMessage::new(content) }, queue)?;
         Ok(())
     }
 
@@ -2079,6 +2181,51 @@ mod tests {
             stale_cache_hint(&stale),
             "Cache expired: your next message re-sends 401k tokens for ~$2.00 ($0.08 cached) · /compact to shrink"
         );
+    }
+
+    #[test]
+    fn history_keeps_collapsed_pastes() {
+        let mut editor = Editor::default();
+        editor.insert("fix ");
+        editor.insert_paste("error\n".repeat(20));
+        let draft = editor.snapshot();
+        let mut lines = vec![history_line(&Draft::plain("plain")).unwrap(), history_line(&draft).unwrap()];
+        assert_eq!(lines[0], r#""plain""#);
+        // A paste that no longer fits its text is dropped rather than recalled wrongly.
+        let mut broken = draft.clone();
+        broken.pastes[0].range.end += 100;
+        lines.push(history_line(&broken).unwrap());
+        lines.push("not json".into());
+        assert_eq!(parse_history(&lines.join("\n")), vec![Draft::plain("plain"), draft]);
+    }
+
+    fn pasted_message() -> (String, UserMessage) {
+        let pasted = "line\n".repeat(30);
+        let text = format!("look at {pasted}please");
+        let start = "look at ".len();
+        let span = start..start + pasted.len();
+        let pastes = vec![span];
+        (text.clone(), UserMessage { pastes, ..UserMessage::new(vec![ContentBlock::text(text)]) })
+    }
+
+    #[test]
+    fn transcript_collapses_pastes() {
+        let (_, user) = pasted_message();
+        let lines: Vec<String> =
+            render::user_lines(&user).into_iter().map(|line| crate::util::strip_ansi(&line.text)).collect();
+        assert_eq!(lines, vec!["look at [pasted 30 lines]please"]);
+    }
+
+    #[test]
+    fn queued_messages_return_collapsed_without_attachments() {
+        let (text, mut user) = pasted_message();
+        let file = std::env::temp_dir().join(format!("viper-queued-{}.txt", uuid::Uuid::new_v4().simple()));
+        std::fs::write(&file, "contents").unwrap();
+        user.content.push(crate::mentions::attach(&file, "notes.txt").unwrap());
+        std::fs::remove_file(&file).unwrap();
+        let draft = queued_draft(&user);
+        assert_eq!(draft.text, "look at [pasted 30 lines]please");
+        assert_eq!(draft.expanded(), text);
     }
 
     #[test]

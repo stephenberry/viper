@@ -228,10 +228,6 @@ pub struct SessionStats {
     pub compaction_threshold: u64,
 }
 
-fn text_of(message: &UserMessage) -> String {
-    crate::message::content_text(&message.content)
-}
-
 impl Agent {
     pub fn new(
         setup: AgentSetup,
@@ -347,9 +343,10 @@ impl Agent {
         self.state().session.name()
     }
 
-    pub fn queued(&self) -> (Vec<String>, Vec<String>) {
+    /// The messages waiting to steer the current run and to follow it.
+    pub fn queued(&self) -> (Vec<UserMessage>, Vec<UserMessage>) {
         let state = self.state();
-        (state.steering.iter().map(text_of).collect(), state.follow_up.iter().map(text_of).collect())
+        (state.steering.iter().cloned().collect(), state.follow_up.iter().cloned().collect())
     }
 
     pub fn snapshot(&self) -> AgentSnapshot {
@@ -596,7 +593,11 @@ impl Agent {
     /// Send a user message. When the agent is running, `queue` decides whether the message
     /// steers the current run or waits as a follow-up; without it, a busy agent is an error.
     pub fn prompt(&self, content: Vec<ContentBlock>, queue: Option<QueueMode>) -> Result<PromptDisposition> {
-        let message = UserMessage::new(content);
+        self.prompt_message(UserMessage::new(content), queue)
+    }
+
+    /// [`Agent::prompt`] with a prepared message.
+    pub fn prompt_message(&self, message: UserMessage, queue: Option<QueueMode>) -> Result<PromptDisposition> {
         let mut state = self.state();
         match state.busy {
             None => {
@@ -627,23 +628,22 @@ impl Agent {
 
     fn emit_queue(&self) {
         let (steering, follow_up) = self.queued();
-        self.emit(AgentEvent::QueueUpdate { steering, follow_up });
+        let text = |messages: Vec<UserMessage>| messages.iter().map(UserMessage::text).collect();
+        self.emit(AgentEvent::QueueUpdate { steering: text(steering), follow_up: text(follow_up) });
     }
 
-    /// Remove all queued messages, returning their text.
-    pub fn clear_queue(&self) -> (Vec<String>, Vec<String>) {
+    /// Remove all queued messages, returning them.
+    pub fn clear_queue(&self) -> (Vec<UserMessage>, Vec<UserMessage>) {
         let queued = {
             let mut state = self.state();
-            let steering = state.steering.drain(..).map(|m| text_of(&m)).collect();
-            let follow_up = state.follow_up.drain(..).map(|m| text_of(&m)).collect();
-            (steering, follow_up)
+            (state.steering.drain(..).collect(), state.follow_up.drain(..).collect())
         };
         self.emit_queue();
         queued
     }
 
     /// Abort the current run or command. Queued messages are removed and returned.
-    pub fn abort(&self) -> Vec<String> {
+    pub fn abort(&self) -> Vec<UserMessage> {
         if let Some(cancel) = self.state().cancel.clone() {
             cancel.cancel();
         }

@@ -1,11 +1,16 @@
 //! Rendering of transcript items into styled lines (unwrapped; the app wraps to the width).
 
+use std::ops::Range;
+
 use serde_json::Value;
 
+use super::editor::Draft;
 use super::markdown::MarkdownRenderer;
 use super::style::*;
 use super::text::sanitize;
-use crate::message::{AssistantMessage, BashExecutionMessage, ContentBlock, Message, StopReason, content_text};
+use crate::message::{
+    AssistantMessage, BashExecutionMessage, ContentBlock, Message, StopReason, UserMessage, content_text,
+};
 use crate::tools::ToolOutput;
 
 /// A logical line plus the prefixes used when it wraps.
@@ -31,20 +36,27 @@ pub const BODY_FIRST: &str = "  ⎿ ";
 pub const PROMPT_PREFIX: &str = "\u{1b}[36m›\u{1b}[0m ";
 pub const BODY_REST: &str = "    ";
 
-pub fn user_lines(content: &[ContentBlock]) -> Vec<Line> {
-    // Attached files are listed by name rather than shown in full.
-    let (attached, written): (Vec<&ContentBlock>, Vec<&ContentBlock>) = content.iter().partition(
-        |block| matches!(block, ContentBlock::Text { text } if crate::mentions::attachment_name(text).is_some()),
-    );
-    let written: Vec<ContentBlock> = written.into_iter().cloned().collect();
-    let text = sanitize(&content_text(&written));
+pub fn user_lines(user: &UserMessage) -> Vec<Line> {
+    let content = &user.content;
+    // Attached files are listed by name rather than shown in full, and pastes as placeholders.
+    let written: Vec<String> = content
+        .iter()
+        .enumerate()
+        .filter_map(|(index, block)| match block {
+            ContentBlock::Text { text } if crate::mentions::attachment_name(text).is_none() => {
+                Some(if index == 0 { collapse_pastes(text, &user.pastes) } else { sanitize(text) })
+            }
+            _ => None,
+        })
+        .collect();
+    let text = written.join("\n");
     let images = content.iter().filter(|b| matches!(b, ContentBlock::Image { .. })).count();
     let mut lines: Vec<Line> = text
         .lines()
         .enumerate()
         .map(|(i, l)| Line::indented(format!("{BOLD}{l}{RESET}"), if i == 0 { PROMPT_PREFIX } else { "  " }, "  "))
         .collect();
-    let mut labels: Vec<String> = attached
+    let mut labels: Vec<String> = content
         .iter()
         .filter_map(|block| match block {
             ContentBlock::Text { text } => {
@@ -61,6 +73,20 @@ pub fn user_lines(content: &[ContentBlock]) -> Vec<Line> {
         lines.push(Line::indented(dim(&labels.join(" ")), prefix, "  "));
     }
     lines
+}
+
+/// A user message's text, sanitized, with its pasted spans shown as placeholders.
+fn collapse_pastes(text: &str, pastes: &[Range<usize>]) -> String {
+    let draft = Draft::collapse(text, pastes);
+    let mut out = String::new();
+    let mut last = 0;
+    for paste in &draft.pastes {
+        out.push_str(&sanitize(&draft.text[last..paste.range.start]));
+        out.push_str(&format!("{RESET}{CYAN}{}{RESET}{BOLD}", &draft.text[paste.range.clone()]));
+        last = paste.range.end;
+    }
+    out.push_str(&sanitize(&draft.text[last..]));
+    out
 }
 
 /// Placeholder shown for thinking that is hidden or redacted.
@@ -289,7 +315,7 @@ pub fn transcript_lines(messages: &[Message], hide_thinking: bool, max_tool_line
         match message {
             Message::User(user) => {
                 lines.push(Line::plain(""));
-                lines.extend(user_lines(&user.content));
+                lines.extend(user_lines(user));
             }
             Message::Assistant(assistant) => {
                 for call in assistant.tool_calls() {

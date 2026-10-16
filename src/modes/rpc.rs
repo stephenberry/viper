@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 
 use crate::agent::{Agent, AgentEvent, QueueMode};
 use crate::config::{CacheRetention, ThinkingLevel};
-use crate::message::ContentBlock;
+use crate::message::{ContentBlock, UserMessage};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -90,6 +90,11 @@ enum Command {
     },
     GetMessages,
     GetCommands,
+}
+
+/// Queued messages as the text the client sent.
+fn texts(messages: &[UserMessage]) -> Vec<String> {
+    messages.iter().map(UserMessage::text).collect()
 }
 
 fn content(message: String, images: Vec<ImageInput>) -> Vec<ContentBlock> {
@@ -200,12 +205,11 @@ fn handle(agent: &Agent, responder: &Responder, id: Option<Value>, name: &str, c
             agent.prompt(content(message, images), Some(QueueMode::FollowUp)).map(|d| Some(json!({"disposition": d}))),
         ),
         Command::Abort => {
-            let returned = agent.abort();
-            reply(Ok(Some(json!({"returnedMessages": returned}))));
+            reply(Ok(Some(json!({"returnedMessages": texts(&agent.abort())}))));
         }
         Command::ClearQueue => {
             let (steering, follow_up) = agent.clear_queue();
-            reply(Ok(Some(json!({"steering": steering, "followUp": follow_up}))));
+            reply(Ok(Some(json!({"steering": texts(&steering), "followUp": texts(&follow_up)}))));
         }
         Command::NewSession => reply(agent.new_session().map(|_| Some(json!(agent.snapshot())))),
         Command::GetState => reply(Ok(Some(json!(agent.snapshot())))),

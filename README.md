@@ -74,6 +74,7 @@ Output goes to your terminal's normal scrollback, so scrolling and copying work 
 | Ctrl+L | Pick a model |
 | Ctrl+G | Edit the message in `$VISUAL` or `$EDITOR` |
 | Ctrl+V | Paste an image (or drag an image file in) |
+| Ctrl+P | Expand a large paste, which is shown collapsed as `[pasted N lines]` |
 
 Type `!command` to run a shell command and share its output with the model, or `!!command` to run it without sharing. Type `/help` for slash commands such as `/model`, `/resume`, `/compact`, and `/login`.
 
