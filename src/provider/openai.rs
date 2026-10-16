@@ -373,7 +373,13 @@ fn finish(out: &mut AssistantMessage, state: &mut StreamState, on_delta: &mut De
     out.stop_reason = match state.finish_reason.as_deref() {
         Some("length") => StopReason::Length,
         Some("content_filter") => {
-            out.error_message = Some("The response was blocked by a content filter".into());
+            // LiteLLM reports Anthropic refusals and Bedrock guardrail interventions this way and
+            // drops their details, which the Anthropic Messages API keeps.
+            out.error_message = Some(
+                "The response was blocked by a content filter (a model refusal or a gateway guardrail; \
+                 the anthropic-messages API reports which)"
+                    .into(),
+            );
             StopReason::Error
         }
         _ if has_tools => StopReason::ToolUse,

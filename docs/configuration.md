@@ -61,7 +61,7 @@ The quickest setup is `/login litellm`, which also adds the gateway's models (se
 }
 ```
 
-A model whose id names a built-in Claude model inherits its context window, output limit, thinking support, image support, and prices. The id can match exactly, after the last `/` (`anthropic/claude-opus-5-5`), or after the last `.` (Bedrock's `us.anthropic.claude-opus-5-5`). Use `base` to inherit from a built-in model under a different name. Fields you set override inherited ones, which matters when a gateway prices or limits a model differently.
+A model whose id names a built-in Claude model inherits its context window, output limit, thinking support, image support, and prices. The id can match exactly, after the last `/` (`anthropic/claude-opus-5-5`), or after the last `.` (Bedrock's `us.anthropic.claude-opus-5-5`). Use `base` to inherit from a built-in model under a different name. viper supports Claude 5.5 and newer: older Claude models (such as `claude-sonnet-5` or `claude-opus-4-8`) are left out of the model list, refused by `--model` and `/model`, and skipped by `/sync-models`. Fields you set override inherited ones, which matters when a gateway prices or limits a model differently.
 
 Models are identified as `provider/id`. To list the same gateway model twice (for example through both endpoints), give one an `alias`: viper selects it as `provider/alias` and still sends `id` to the gateway.
 
@@ -75,7 +75,7 @@ Opening the model selector (`/model` or **Ctrl+L**) also syncs, in the backgroun
 
 **Provider:** `baseUrl`, `apiKey`, `api` (`anthropic-messages` or `openai-completions`), `authHeader` (`bearer`, the default for custom providers, or `xapikey`), `headers`, `budgetUrl` (see [Budgets](#budgets)).
 
-**Model:** `id`, `alias`, `name`, `base`, `api`, `contextWindow`, `maxTokens`, `reasoning` (`adaptive`, `budget`, `effort`, `none`), `thinkingLevels`, `images`, `cost` (`input`, `output`, `cacheRead`, `cacheWrite` in dollars per million tokens, plus an optional `longPrompt` with the same fields and `above`: the prompt length in tokens past which its prices apply to the whole request), `cacheControl`, `eagerInputStreaming`, `headers`, and `extraBody` (fields merged into every request body).
+**Model:** `id`, `alias`, `name`, `base`, `api`, `contextWindow`, `maxTokens`, `reasoning` (`adaptive`, `effort`, `none`), `thinkingLevels`, `images`, `cost` (`input`, `output`, `cacheRead`, `cacheWrite` in dollars per million tokens, plus an optional `longPrompt` with the same fields and `above`: the prompt length in tokens past which its prices apply to the whole request), `cacheControl`, `eagerInputStreaming`, `headers`, and `extraBody` (fields merged into every request body).
 
 ## Budgets
 
@@ -132,7 +132,7 @@ For models with `cacheControl` (on by default for known Claude models, directly 
 
 A cache entry expires an hour after it was last used; writing it costs 2x the input price. `"cacheRetention": "short"` (or `/cache short`) keeps entries for 5 minutes instead, at 1.25x the input price per write, which is cheaper when you rarely pause for more than a few minutes between messages. The hour pays off when you step away to wait on a build or test run, since an expired cache means writing the whole conversation again. Some gateway routes ignore the one-hour lifetime and write five-minute entries; viper sees this in the reported usage, and prices and refreshes those entries as five-minute ones.
 
-When a tool call runs longer than the cache lasts, the next request would have to write the whole conversation to the cache again. With `"cacheWarming": "streaming"` (the default), viper refreshes the cache shortly before it expires by repeating the last request with a one-token reply, but only when that is expected to save at least $0.05. Refreshes count toward the session's cost; `"off"` turns them off. They are skipped for models without prices, models that think within a fixed budget, and gateway models with thinking on, whose cache a repeated request might not reuse.
+When a tool call runs longer than the cache lasts, the next request would have to write the whole conversation to the cache again. With `"cacheWarming": "streaming"` (the default), viper refreshes the cache shortly before it expires by repeating the last request with a one-token reply, but only when that is expected to save at least $0.05. Refreshes count toward the session's cost; `"off"` turns them off. They are skipped for models without prices and gateway models with thinking on, whose cache a repeated request might not reuse.
 
 After a long pause the cache has expired, and the next message pays to write the whole conversation to the cache again. When that costs at least $0.25 more than reading it would have, a warning under the input shows the cost, so you can run `/compact` first to shrink the context.
 
@@ -142,7 +142,7 @@ Besides the default locations, viper loads skills from the directories in `skill
 
 ## Compaction
 
-When the context comes within `reserveTokens` of the model's window, viper summarizes older messages into a structured checkpoint and keeps roughly the last `keepRecentTokens` verbatim. If the kept messages start partway through a long turn, the start of that turn (your request and the work so far) gets its own summary so the request is not lost. If a request overflows the context anyway, viper compacts and retries once. The full history always stays in the session file.
+When the context comes within `reserveTokens` of the model's window, viper summarizes older messages into a structured checkpoint and keeps roughly the last `keepRecentTokens` verbatim. The summary request repeats the conversation's own request up to the cut, so it reuses the prompt cache. If the kept messages start partway through a long turn, the summary also records the request that started it so the request is not lost. Kept messages are sent without their thinking blocks, since the model only accepts those with the history they followed. If a request overflows the context anyway, viper compacts and retries once, shortening tool output in the summary request if that overflows too. The full history always stays in the session file.
 
 `/autocompact` changes when this happens:
 

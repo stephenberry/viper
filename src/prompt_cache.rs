@@ -71,9 +71,7 @@ pub fn worthwhile(model: &Model, thinking: ThinkingLevel, retention: CacheRetent
 }
 
 /// Whether repeating a request with a one-token output limit reads its cache entry without other
-/// effects. Changing thinking parameters invalidates cached messages, and a model that thinks
-/// within a budget would get a budget well above one token (see `anthropic::build_body`) and
-/// could think at length. Through an OpenAI-compatible gateway, how the gateway turns a
+/// effects. Changing thinking parameters invalidates cached messages. Through an OpenAI-compatible gateway, how the gateway turns a
 /// reasoning effort into thinking parameters is unknown, so only requests without thinking are
 /// repeated there.
 fn replayable(model: &Model, thinking: ThinkingLevel) -> bool {
@@ -225,12 +223,6 @@ mod tests {
     fn repeats_only_requests_whose_thinking_stays_the_same() {
         let adaptive = opus();
         assert!(replayable(&adaptive, ThinkingLevel::High));
-
-        let mut budget = adaptive.clone();
-        budget.reasoning = Reasoning::Budget;
-        budget.thinking_levels = vec![ThinkingLevel::Off, ThinkingLevel::High];
-        assert!(!replayable(&budget, ThinkingLevel::High));
-        assert!(replayable(&budget, ThinkingLevel::Off));
 
         let mut gateway = adaptive.clone();
         gateway.api = Api::OpenAiCompletions;

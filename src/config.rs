@@ -494,8 +494,6 @@ pub enum Reasoning {
     None,
     /// Anthropic adaptive thinking controlled by `output_config.effort`.
     Adaptive,
-    /// Anthropic extended thinking with a token budget (older models).
-    Budget,
     /// OpenAI-style `reasoning_effort` parameter.
     Effort,
 }
@@ -772,13 +770,12 @@ struct BuiltinModel {
     cost: ModelCost,
 }
 
-use ThinkingLevel::{High, Low, Max, Medium, Minimal, Off, Xhigh};
+use ThinkingLevel::{High, Low, Max, Medium, Off, Xhigh};
 
 /// Adaptive-thinking models that cannot disable thinking.
 const ALWAYS_THINKING: &[ThinkingLevel] = &[Low, Medium, High, Xhigh, Max];
 /// Adaptive-thinking models that accept `thinking: {type: "disabled"}`.
 const OPTIONAL_THINKING: &[ThinkingLevel] = &[Off, Low, Medium, High, Xhigh, Max];
-const BUDGET_THINKING: &[ThinkingLevel] = &[Off, Minimal, Low, Medium, High];
 
 const fn cost(input: f64, output: f64, cache_read: f64) -> ModelCost {
     // Five-minute cache writes cost 1.25x the input price.
@@ -825,60 +822,6 @@ const BUILTIN_ANTHROPIC: &[BuiltinModel] = &[
         levels: OPTIONAL_THINKING,
         cost: tiered_cost(cost(0.10, 0.50, 0.01), 100_000, cost(0.50, 2.50, 0.05)),
     },
-    BuiltinModel {
-        id: "claude-fable-5-1",
-        name: "Claude Fable 5.1",
-        context_window: 1_000_000,
-        max_tokens: 128_000,
-        reasoning: Reasoning::Adaptive,
-        levels: ALWAYS_THINKING,
-        cost: cost(10.0, 50.0, 0.25),
-    },
-    BuiltinModel {
-        id: "claude-fable-5",
-        name: "Claude Fable 5",
-        context_window: 1_000_000,
-        max_tokens: 128_000,
-        reasoning: Reasoning::Adaptive,
-        levels: ALWAYS_THINKING,
-        cost: cost(10.0, 50.0, 1.0),
-    },
-    BuiltinModel {
-        id: "claude-opus-5",
-        name: "Claude Opus 5",
-        context_window: 1_000_000,
-        max_tokens: 128_000,
-        reasoning: Reasoning::Adaptive,
-        levels: OPTIONAL_THINKING,
-        cost: cost(5.0, 25.0, 0.50),
-    },
-    BuiltinModel {
-        id: "claude-sonnet-5",
-        name: "Claude Sonnet 5",
-        context_window: 1_000_000,
-        max_tokens: 128_000,
-        reasoning: Reasoning::Adaptive,
-        levels: OPTIONAL_THINKING,
-        cost: cost(2.0, 10.0, 0.20),
-    },
-    BuiltinModel {
-        id: "claude-opus-4-8",
-        name: "Claude Opus 4.8",
-        context_window: 1_000_000,
-        max_tokens: 128_000,
-        reasoning: Reasoning::Adaptive,
-        levels: OPTIONAL_THINKING,
-        cost: cost(5.0, 25.0, 0.50),
-    },
-    BuiltinModel {
-        id: "claude-haiku-4-5",
-        name: "Claude Haiku 4.5",
-        context_window: 200_000,
-        max_tokens: 64_000,
-        reasoning: Reasoning::Budget,
-        levels: BUDGET_THINKING,
-        cost: cost(1.0, 5.0, 0.10),
-    },
 ];
 
 /// Output tokens requested per response unless a model sets `maxTokens` explicitly.
@@ -914,6 +857,42 @@ pub fn names_builtin_model(id: &str) -> bool {
 fn inferred_builtin(id: &str) -> Option<&'static BuiltinModel> {
     let segment = id.rsplit('/').next().unwrap_or(id);
     builtin(id).or_else(|| builtin(segment)).or_else(|| builtin(segment.rsplit('.').next().unwrap_or(segment)))
+}
+
+/// The oldest Claude version viper supports. Compaction relies on how this generation treats
+/// thinking blocks: they are bound to the conversation that produced them, and removing them is
+/// accepted anywhere, even within a tool round.
+const MIN_CLAUDE_VERSION: (u32, u32) = (5, 5);
+
+/// The version of a Claude model id: (5, 5) for `claude-sonnet-5-5`, `us.anthropic.claude-sonnet-5-5`,
+/// or `claude-sonnet-5-5[1m]`, and (3, 5) for the older form `claude-3-5-sonnet-20241022`. `None`
+/// when `id` does not name a Claude model by family and version.
+fn claude_version(id: &str) -> Option<(u32, u32)> {
+    const FAMILIES: &[&str] = &["opus", "sonnet", "haiku", "fable", "mythos", "instant"];
+    let name = &id[id.find("claude-")? + "claude-".len()..];
+    let name = name.split('[').next().unwrap_or(name);
+    let mut parts = name.split(['-', '.', '@', ':']).peekable();
+    if parts.peek().is_some_and(|family| FAMILIES.contains(family)) {
+        parts.next();
+    }
+    let mut version = Vec::new();
+    for part in parts.take(2) {
+        // A date or the family name (in the older form) ends the version.
+        match part.parse::<u32>() {
+            Ok(number) if part.len() <= 2 => version.push(number),
+            _ => break,
+        }
+    }
+    match version[..] {
+        [major] => Some((major, 0)),
+        [major, minor] => Some((major, minor)),
+        _ => None,
+    }
+}
+
+/// Whether `id` names a Claude model older than viper supports.
+pub fn is_unsupported_claude_model(id: &str) -> bool {
+    claude_version(id).is_some_and(|version| version < MIN_CLAUDE_VERSION)
 }
 
 pub(crate) fn builtin_anthropic_models() -> Vec<Model> {
@@ -1000,9 +979,8 @@ fn resolve_custom_model(provider_name: &str, provider: &ProviderConfig, config: 
     });
     let thinking_levels = config.thinking_levels.clone().unwrap_or_else(|| match reasoning {
         Reasoning::None => Vec::new(),
-        Reasoning::Adaptive | Reasoning::Budget => match inherited {
+        Reasoning::Adaptive => match inherited {
             Some(b) if b.reasoning == reasoning => b.levels.to_vec(),
-            _ if reasoning == Reasoning::Budget => BUDGET_THINKING.to_vec(),
             _ => OPTIONAL_THINKING.to_vec(),
         },
         Reasoning::Effort => match inherited {
@@ -1108,6 +1086,7 @@ impl ModelRegistry {
                 }
             }
         }
+        models.retain(|model| !is_unsupported_claude_model(&model.id));
         Ok(ModelRegistry { models, connections })
     }
 
@@ -1161,6 +1140,9 @@ impl ModelRegistry {
     /// models with credentials, so a short query is not ambiguous because of unusable providers.
     pub fn find(&self, query: &str) -> Result<Model> {
         let query = query.trim();
+        if is_unsupported_claude_model(query) {
+            bail!("'{query}' is older than Claude 5.5, the oldest Claude generation viper supports");
+        }
         if let Some(model) = self.models.iter().find(|m| m.key() == query) {
             return Ok(model.clone());
         }
@@ -1255,9 +1237,9 @@ mod tests {
         let mut model = builtin_anthropic_models().remove(0);
         model.thinking_levels = ALWAYS_THINKING.to_vec();
         assert_eq!(model.clamp_thinking(Off), Low);
-        assert_eq!(model.clamp_thinking(Minimal), Low);
+        assert_eq!(model.clamp_thinking(ThinkingLevel::Minimal), Low);
         assert_eq!(model.clamp_thinking(High), High);
-        model.thinking_levels = BUDGET_THINKING.to_vec();
+        model.thinking_levels = vec![Off, Low, Medium, High];
         assert_eq!(model.clamp_thinking(Max), High);
     }
 
@@ -1442,6 +1424,45 @@ mod tests {
         let mut registry = ModelRegistry::from_models(vec![model]);
         registry.apply_auth(&auth);
         assert_eq!(registry.all()[0].api_key, Some(ConfigValue::Literal("from-auth".into())));
+    }
+
+    #[test]
+    fn reads_claude_versions_from_model_ids() {
+        for (id, version) in [
+            ("claude-sonnet-5-5", Some((5, 5))),
+            ("us.anthropic.claude-opus-5-5", Some((5, 5))),
+            ("anthropic/claude-haiku-5-5[1m]", Some((5, 5))),
+            ("claude-opus-5", Some((5, 0))),
+            ("claude-sonnet-4-5-20250929", Some((4, 5))),
+            ("anthropic.claude-3-haiku-20240307-v1:0", Some((3, 0))),
+            ("claude-3-5-sonnet-20241022", Some((3, 5))),
+            ("claude-opus-4-1@20250805", Some((4, 1))),
+            ("claude-sonnet", None),
+            ("claude-proxy/gpt-4", None),
+            ("gpt-5", None),
+        ] {
+            assert_eq!(claude_version(id), version, "{id}");
+        }
+        assert!(is_unsupported_claude_model("claude-fable-5-1"));
+        assert!(!is_unsupported_claude_model("claude-opus-6"));
+    }
+
+    #[test]
+    fn older_claude_models_are_dropped_and_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(
+            &path,
+            r#"{"providers": {"gw": {"baseUrl": "https://gw", "models": [
+                {"id": "us.anthropic.claude-sonnet-5-5"}, {"id": "us.anthropic.claude-sonnet-5"}, {"id": "gpt-5"}
+            ]}}}"#,
+        )
+        .unwrap();
+        let registry = ModelRegistry::load_models(&path).unwrap();
+        let ids: Vec<&str> = registry.all().iter().filter(|m| m.provider == "gw").map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["us.anthropic.claude-sonnet-5-5", "gpt-5"]);
+        let err = registry.find("gw/us.anthropic.claude-sonnet-5").unwrap_err();
+        assert!(err.to_string().contains("older than Claude 5.5"), "{err}");
     }
 
     #[test]

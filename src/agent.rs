@@ -787,6 +787,26 @@ impl Agent {
         self.finish_busy();
     }
 
+    /// The conversation's request for `messages`. Compaction repeats it for the messages it
+    /// summarizes, so it reads the same cache and keeps thinking blocks valid.
+    fn request<'a>(
+        &'a self,
+        model: &'a Model,
+        thinking: ThinkingLevel,
+        messages: &'a [Message],
+        retention: CacheRetention,
+    ) -> Request<'a> {
+        Request {
+            model,
+            system_prompt: &self.inner.setup.system_prompt,
+            messages,
+            tools: &self.inner.tool_specs,
+            thinking,
+            max_tokens: None,
+            cache_retention: Some(retention),
+        }
+    }
+
     /// Stream one assistant response, retrying transient failures that happen before any
     /// content arrives. Failures are encoded in the returned message, with their kind beside it,
     /// and the request is returned as sent.
@@ -797,15 +817,7 @@ impl Agent {
         };
         let retry = &self.inner.setup.settings.retry;
         let max_retries = if auto_retry { retry.max_retries } else { 0 };
-        let request = Request {
-            model: &model,
-            system_prompt: &self.inner.setup.system_prompt,
-            messages: &messages,
-            tools: &self.inner.tool_specs,
-            thinking,
-            max_tokens: None,
-            cache_retention: Some(retention),
-        };
+        let request = self.request(&model, thinking, &messages, retention);
 
         let mut message = provider::new_assistant_message(&model, thinking);
         self.emit(AgentEvent::MessageStart { message: Message::Assistant(message.clone()) });
@@ -905,15 +917,8 @@ impl Agent {
     /// Repeat `sent` with a one-token output limit, which reads its cached prefix and so renews
     /// the cache. Records the cost in the session; returns whether the request succeeded.
     async fn refresh_cache(&self, sent: &SentRequest, cancel: &CancellationToken) -> bool {
-        let request = Request {
-            model: &sent.model,
-            system_prompt: &self.inner.setup.system_prompt,
-            messages: &sent.messages,
-            tools: &self.inner.tool_specs,
-            thinking: sent.thinking,
-            max_tokens: Some(1),
-            cache_retention: Some(sent.retention),
-        };
+        let request =
+            Request { max_tokens: Some(1), ..self.request(&sent.model, sent.thinking, &sent.messages, sent.retention) };
         let mut response = provider::new_assistant_message(&sent.model, sent.thinking);
         let result = provider::stream(&self.inner.client, &request, &mut response, &mut |_, _| {}, cancel).await;
         if result.is_err() || matches!(response.stop_reason, StopReason::Error | StopReason::Aborted) {
@@ -1051,7 +1056,7 @@ impl Agent {
 
     async fn do_compact(&self, instructions: Option<&str>, cancel: &CancellationToken) -> Result<CompactionResult> {
         let settings = &self.inner.setup.settings.compaction;
-        let (model, plan) = {
+        let (model, thinking, retention, plan) = {
             let state = self.state();
             let items = state.session.context();
             let previous_details = state.session.entries().iter().rev().find_map(|e| match e {
@@ -1059,7 +1064,7 @@ impl Agent {
                 _ => None,
             });
             let plan = compaction::plan(&items, settings.keep_recent_tokens, previous_details.flatten().as_ref());
-            (state.model.clone(), plan)
+            (state.model.clone(), state.thinking, state.cache_retention, plan)
         };
         let plan = plan.ok_or_else(|| {
             anyhow!(
@@ -1068,10 +1073,10 @@ impl Agent {
                 settings.keep_recent_tokens
             )
         })?;
-        let result =
-            compaction::summarize(&self.inner.client, &model, &plan, instructions, settings.reserve_tokens, cancel)
-                .await
-                .map_err(|err| anyhow!(err.message))?;
+        let conversation = self.request(&model, thinking, &plan.messages, retention);
+        let result = compaction::summarize(&self.inner.client, conversation, &plan, instructions, cancel)
+            .await
+            .map_err(|err| anyhow!(err.message))?;
 
         let mut state = self.state();
         let id = new_entry_id();
@@ -1581,16 +1586,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compaction_inside_a_turn_summarizes_its_request_separately() {
+    async fn compaction_repeats_the_conversation_request_cut_short() {
         // Each command prints ~11k tokens, so the 20k tokens kept start inside the second turn.
         let big = "head -c 46000 /dev/zero | tr '\\0' x";
         let server = MockServer::start(vec![
             anthropic_text("earlier answer"),
-            anthropic_tool_call("t1", big),
-            anthropic_tool_call("t2", big),
+            anthropic_thinking_tool_call("t1", big),
+            anthropic_thinking_tool_call("t2", big),
             anthropic_text("built"),
-            anthropic_text("summary one"),
-            anthropic_text("summary two"),
+            anthropic_text("## Goal\nBuild it"),
+            anthropic_text("next answer"),
         ])
         .await;
         let dir = tempfile::tempdir().unwrap();
@@ -1600,18 +1605,112 @@ mod tests {
             agent.wait_idle().await;
         }
         let result = agent.compact(None).unwrap().await.unwrap().unwrap();
-        assert!(result.summary.contains("\n\n---\n\n**Turn Context (split turn):**\n\n"));
+        assert!(result.summary.starts_with("## Goal\nBuild it"));
         // The kept region starts at the second tool call, inside the "build it" turn.
         assert_eq!(roles(&agent.messages()), ["summary", "assistant", "toolResult", "assistant"]);
+        agent.prompt(vec![ContentBlock::text("next")], None).unwrap();
+        agent.wait_idle().await;
 
-        // The history and the turn's beginning were summarized by separate requests.
         let requests = server.requests.lock().unwrap();
-        let prompts: Vec<&str> =
-            requests[4..].iter().map(|r| r["messages"][0]["content"][0]["text"].as_str().unwrap()).collect();
-        let turn = prompts.iter().find(|p| p.contains("## Original Request")).unwrap();
-        let history = prompts.iter().find(|p| !p.contains("## Original Request")).unwrap();
-        assert!(turn.contains("build it") && !turn.contains("earlier answer"));
-        assert!(history.contains("earlier answer") && !history.contains("build it"));
+        assert_eq!(requests.len(), 6);
+        // The summary request is the request that returned the second tool call, with the
+        // summary prompt after the tool result: same settings, same messages, same thinking.
+        let (summary, cut) = (without_cache_control(&requests[4]), without_cache_control(&requests[2]));
+        for key in ["system", "tools", "thinking", "output_config"] {
+            assert_eq!(summary[key], cut[key], "{key}");
+        }
+        let mut expected = cut["messages"].clone();
+        let last = expected.as_array_mut().unwrap().last_mut().unwrap();
+        last["content"].as_array_mut().unwrap().push(json!({"type": "text", "text": final_prompt(&requests[4])}));
+        assert_eq!(summary["messages"], expected);
+        assert_eq!(summary["messages"][3]["content"][0]["type"], "thinking");
+        assert!(final_prompt(&requests[4]).contains("## Current Turn"));
+        assert!(final_prompt(&requests[4]).contains("respond with text only"));
+        // Afterwards the kept tool call goes out without the thinking produced before the summary.
+        assert!(!requests[5]["messages"].to_string().contains(r#""type":"thinking""#));
+    }
+
+    #[tokio::test]
+    async fn compaction_condenses_tool_output_when_the_summary_request_overflows() {
+        let big = "head -c 46000 /dev/zero | tr '\\0' x";
+        let too_long = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long"}}"#;
+        let server = MockServer::start(vec![
+            anthropic_thinking_tool_call("t1", big),
+            anthropic_text("done"),
+            anthropic_text("second answer"),
+            MockResponse::error(400, too_long),
+            anthropic_text("## Goal\nCondensed"),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, _events) = agent(model(&server.url, Api::AnthropicMessages), dir.path());
+        for text in ["run it".to_string(), "b".repeat(100_000)] {
+            agent.prompt(vec![ContentBlock::text(text)], None).unwrap();
+            agent.wait_idle().await;
+        }
+        let result = agent.compact(None).unwrap().await.unwrap().unwrap();
+        assert!(result.summary.starts_with("## Goal\nCondensed"));
+
+        let requests = server.requests.lock().unwrap();
+        let (full, condensed) = (requests[3]["messages"].to_string(), requests[4]["messages"].to_string());
+        assert!(full.contains(r#""type":"thinking""#) && full.len() > 46_000);
+        assert!(!condensed.contains(r#""type":"thinking""#) && condensed.len() < 10_000);
+        assert!(condensed.contains("more characters truncated"));
+    }
+
+    /// An assistant response with a signed thinking block and a bash tool call.
+    fn anthropic_thinking_tool_call(id: &str, command: &str) -> MockResponse {
+        MockResponse::anthropic(&[
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 100, "output_tokens": 1}}}),
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "plan"}}),
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "sig"}}),
+            json!({"type": "content_block_stop", "index": 0}),
+            json!({"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": id, "name": "bash", "input": {}}}),
+            json!({"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": json!({"command": command}).to_string()}}),
+            json!({"type": "content_block_stop", "index": 1}),
+            json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 20}}),
+            json!({"type": "message_stop"}),
+        ])
+    }
+
+    /// `request` without its cache breakpoints, which move between requests.
+    fn without_cache_control(request: &Value) -> Value {
+        match request {
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .filter(|(k, _)| *k != "cache_control")
+                    .map(|(k, v)| (k.clone(), without_cache_control(v)))
+                    .collect(),
+            ),
+            Value::Array(items) => Value::Array(items.iter().map(without_cache_control).collect()),
+            other => other.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_fails_when_the_summarizer_calls_a_tool() {
+        let server = MockServer::start(vec![
+            anthropic_text("first answer"),
+            anthropic_text("second answer"),
+            anthropic_tool_call("t1", "ls"),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (agent, _events) = agent(model(&server.url, Api::AnthropicMessages), dir.path());
+        for text in ["a", "b"] {
+            agent.prompt(vec![ContentBlock::text(text.repeat(100_000))], None).unwrap();
+            agent.wait_idle().await;
+        }
+        let error = agent.compact(None).unwrap().await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("called a tool"), "{error}");
+        assert_eq!(roles(&agent.messages()), ["user", "assistant", "user", "assistant"]);
+    }
+
+    /// The text of the last block of a request's last message.
+    fn final_prompt(request: &Value) -> &str {
+        let content = request["messages"].as_array().unwrap().last().unwrap()["content"].as_array().unwrap();
+        content.last().unwrap()["text"].as_str().unwrap()
     }
 
     #[tokio::test]
@@ -1664,10 +1763,13 @@ mod tests {
         // The summary replaces the first exchange; the second is kept verbatim.
         assert_eq!(roles(&agent.messages()), ["summary", "user", "assistant"]);
         let requests = server.requests.lock().unwrap();
-        let prompt = requests[2]["messages"][0]["content"][0]["text"].as_str().unwrap();
-        assert!(prompt.contains("<conversation>"));
-        assert!(prompt.contains("first answer"));
-        assert!(!prompt.contains("second answer"));
-        assert!(prompt.contains("focus on tests"));
+        let messages = requests[2]["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["content"][0]["text"], "first answer");
+        assert!(!requests[2]["messages"].to_string().contains("second answer"));
+        assert!(final_prompt(&requests[2]).contains("## Goal"));
+        assert!(final_prompt(&requests[2]).contains("focus on tests"));
+        // The summary reads the conversation's cache: the first exchange carries a breakpoint.
+        assert!(messages[0]["content"][0]["cache_control"].is_object());
     }
 }

@@ -13,7 +13,8 @@ use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{
-    Api, LongPromptCost, Model, ModelCost, ModelRegistry, models_path, names_builtin_model, update_json_object,
+    Api, LongPromptCost, Model, ModelCost, ModelRegistry, is_unsupported_claude_model, models_path,
+    names_builtin_model, update_json_object,
 };
 use crate::provider::{apply_auth, send, v1_url};
 
@@ -36,6 +37,8 @@ pub struct SyncReport {
     pub added: Vec<String>,
     /// Configured ids the server did not list.
     pub unlisted: Vec<String>,
+    /// Listed Claude models older than viper supports, which were not added.
+    pub unsupported: Vec<String>,
 }
 
 impl SyncReport {
@@ -44,6 +47,9 @@ impl SyncReport {
             [] => format!("models.json already lists every model {provider} offers."),
             added => format!("Added {} model(s) to {provider}: {}.", added.len(), added.join(", ")),
         };
+        if !self.unsupported.is_empty() {
+            text.push_str(&format!(" Skipped models older than Claude 5.5: {}.", self.unsupported.join(", ")));
+        }
         if !self.unlisted.is_empty() {
             text.push_str(&format!(" Not listed by the server (left in models.json): {}.", self.unlisted.join(", ")));
         }
@@ -230,7 +236,11 @@ fn save_models(path: &Path, provider: &str, listed: &[ListedModel]) -> Result<Sy
         let configured: Vec<String> =
             models.iter().filter_map(|m| m.get("id").and_then(Value::as_str)).map(str::to_string).collect();
         for model in listed.iter().filter(|m| !configured.contains(&m.id)) {
-            if !report.added.contains(&model.id) {
+            if is_unsupported_claude_model(&model.id) {
+                if !report.unsupported.contains(&model.id) {
+                    report.unsupported.push(model.id.clone());
+                }
+            } else if !report.added.contains(&model.id) {
                 models.push(model_entry(model, provider_api));
                 report.added.push(model.id.clone());
             }
@@ -344,9 +354,12 @@ mod tests {
             ]}}}"#,
         )
         .unwrap();
-        let report = save_models(&path, "gateway", &listing()).unwrap();
+        let mut listed = listing();
+        listed.push(ListedModel { id: "us.anthropic.claude-sonnet-5".into(), ..Default::default() });
+        let report = save_models(&path, "gateway", &listed).unwrap();
         assert_eq!(report.added, ["us.anthropic.claude-opus-5-5", "acme.chat-large", "acme.tiered"]);
         assert_eq!(report.unlisted, ["acme.retired"]);
+        assert_eq!(report.unsupported, ["us.anthropic.claude-sonnet-5"]);
 
         let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let models = saved["providers"]["gateway"]["models"].as_array().unwrap();

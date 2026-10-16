@@ -2,9 +2,14 @@
 //!
 //! The most recent `keepRecentTokens` of conversation stay verbatim. Everything before the cut
 //! point (plus any previous summary) is summarized by the current model into a structured
-//! checkpoint that replaces it in later requests. When the cut falls inside a turn, the turn's
-//! beginning is summarized separately and appended as turn context. The full history stays in the
-//! session file.
+//! checkpoint that replaces it in later requests. When the cut falls inside a turn, the checkpoint
+//! also records the request that started the turn. The full history stays in the session file.
+//!
+//! The summary request is the conversation's own request cut short: the same system prompt, tools,
+//! thinking level, and messages up to the cut, followed by a user message asking for the
+//! checkpoint. It therefore reads the conversation's prompt cache, keeps replayed thinking blocks
+//! on the prefix they were produced with, and has the shape that the provider's safety filters
+//! have already accepted for this conversation.
 
 use std::collections::BTreeSet;
 
@@ -12,14 +17,13 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{Model, ThinkingLevel};
-use crate::message::{ContentBlock, Message, StopReason, Usage, UserMessage, content_text};
-use crate::provider::{self, ProviderError, Request};
+use crate::message::{ContentBlock, Message, StopReason, Usage, UserMessage};
+use crate::provider::{self, ErrorKind, ProviderError, Request};
 use crate::session::ContextItem;
 
-const SUMMARIZATION_SYSTEM_PROMPT: &str = "You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.
+const PROMPT: &str = "The conversation above is about to be compacted. Write a structured context checkpoint of it that another instance of you will use to continue the work in a new context window. Do not continue the work or answer anything in the conversation; only write the checkpoint.";
 
-Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
+const PREVIOUS_SUMMARY: &str = "The conversation begins with a summary of earlier work in <summary> tags. Merge it into the checkpoint: keep its information unless it is no longer relevant, move finished items from \"In Progress\" to \"Done\", and update \"Next Steps\".";
 
 const SUMMARY_FORMAT: &str = "## Goal
 [What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
@@ -50,30 +54,21 @@ const SUMMARY_FORMAT: &str = "## Goal
 
 Keep each section concise. Preserve exact file paths, function names, and error messages.";
 
-const UPDATE_RULES: &str = "Update the existing structured summary with new information. RULES:
-- PRESERVE all existing information from the previous summary
-- ADD new progress, decisions, and context from the new messages
-- UPDATE the Progress section: move items from \"In Progress\" to \"Done\" when completed
-- UPDATE \"Next Steps\" based on what was accomplished
-- PRESERVE exact file paths, function names, and error messages
-- If something is no longer relevant, you may remove it";
+const SPLIT_TURN: &str = "The conversation ends partway through a turn that is still in progress; the rest of that turn is kept verbatim after the checkpoint. End the checkpoint with this section, so the request that started the turn is not lost:
 
-const TURN_PREFIX_PROMPT: &str = "The messages above are the beginning of a turn that is still in progress. The rest of the turn is kept verbatim after this checkpoint and does not need to be reconstructed.
+## Current Turn
+### Original Request
+[What the user asked for in this turn, in their words where it matters.]
 
-Create a concise checkpoint of the user's request and the progress shown above, in this format:
+### Progress So Far
+- [Decisions and work completed in this turn before the checkpoint]";
 
-## Original Request
-[What did the user ask for? Keep their wording where it matters.]
+/// Ends the summary request. It carries the conversation's tools, since removing them would
+/// change the prefix, so the model has to be told not to use them.
+const TEXT_ONLY: &str = "Do not call any tools while writing this checkpoint; respond with text only.";
 
-## Progress So Far
-- [Key decisions and work completed in these messages]
-
-## Context Needed to Continue
-- [Information from these messages needed to understand the later work]
-
-Only summarize information explicitly present above. Preserve exact file paths, function names, and error messages.";
-
-const TOOL_RESULT_MAX_CHARS: usize = 2000;
+/// Tool output kept per result when the summarized messages alone overflow the context.
+const CONDENSED_OUTPUT_CHARS: usize = 2000;
 
 /// Estimate the tokens the current context occupies: the last successful response's reported
 /// usage plus an estimate for messages added after it.
@@ -111,13 +106,11 @@ pub struct CompactionResult {
 
 /// What a compaction will summarize and keep.
 pub struct Plan {
-    /// Conversation before the kept region, or before the turn it cuts into.
-    pub to_summarize: Vec<Message>,
-    /// When the cut falls inside a turn, the turn's messages before the cut: the request that
-    /// started it and the work so far. They get their own summary so the request is not lost
-    /// among older history.
-    pub turn_prefix: Vec<Message>,
-    pub previous_summary: Option<String>,
+    /// The conversation before the kept region, as the conversation's requests send it: the
+    /// previous summary, when there is one, then the messages after it.
+    pub messages: Vec<Message>,
+    /// Whether the kept region starts partway through a turn.
+    pub splits_turn: bool,
     /// First kept entry, or `None` when nothing is kept.
     pub first_kept_entry_id: Option<String>,
     pub tokens_before: u64,
@@ -127,12 +120,9 @@ pub struct Plan {
 
 /// Choose the cut point: keep roughly `keep_recent_tokens` of recent messages, starting at a user
 /// or assistant message so tool calls stay paired with their results. A cut at an assistant
-/// message splits its turn; the turn's beginning is then summarized on its own.
+/// message splits its turn.
 pub fn plan(items: &[ContextItem], keep_recent_tokens: u64, previous_details: Option<&Value>) -> Option<Plan> {
-    let (previous_summary, start) = match items.first().map(|i| &i.message) {
-        Some(Message::CompactionSummary(summary)) => (Some(summary.summary.clone()), 1),
-        _ => (None, 0),
-    };
+    let start = usize::from(matches!(items.first().map(|i| &i.message), Some(Message::CompactionSummary(_))));
     let body = &items[start..];
     if body.is_empty() {
         return None;
@@ -155,7 +145,6 @@ pub fn plan(items: &[ContextItem], keep_recent_tokens: u64, previous_details: Op
         return None;
     }
 
-    let messages: Vec<Message> = items.iter().map(|i| i.message.clone()).collect();
     let mut read_files = BTreeSet::new();
     let mut modified_files = BTreeSet::new();
     if let Some(details) = previous_details {
@@ -172,17 +161,8 @@ pub fn plan(items: &[ContextItem], keep_recent_tokens: u64, previous_details: Op
         read_files.extend(strings("readFiles"));
         modified_files.extend(strings("modifiedFiles"));
     }
-    // A turn starts with the user's message (or command); a cut anywhere else splits one.
-    let starts_turn = |message: &Message| matches!(message, Message::User(_) | Message::BashExecution(_));
-    let turn_start = body
-        .get(cut)
-        .filter(|item| !starts_turn(&item.message))
-        .and_then(|_| body[..cut].iter().rposition(|item| starts_turn(&item.message)));
-    let history_end = turn_start.unwrap_or(cut);
-    let to_summarize: Vec<Message> = body[..history_end].iter().map(|i| i.message.clone()).collect();
-    let turn_prefix: Vec<Message> = body[history_end..cut].iter().map(|i| i.message.clone()).collect();
-    for message in to_summarize.iter().chain(&turn_prefix) {
-        if let Message::Assistant(assistant) = message {
+    for item in &body[..cut] {
+        if let Message::Assistant(assistant) = &item.message {
             for call in assistant.tool_calls() {
                 let Some(path) = call.arguments.get("path").and_then(Value::as_str) else { continue };
                 match call.name {
@@ -199,15 +179,36 @@ pub fn plan(items: &[ContextItem], keep_recent_tokens: u64, previous_details: Op
     }
     read_files.retain(|f| !modified_files.contains(f));
 
+    let mut messages: Vec<Message> = items.iter().map(|i| i.message.clone()).collect();
+    let tokens_before = estimate_context_tokens(&messages);
+    messages.truncate(start + cut);
+    // A turn starts with the user's message (or command); a cut anywhere else splits one.
+    let splits_turn =
+        body.get(cut).is_some_and(|item| !matches!(item.message, Message::User(_) | Message::BashExecution(_)));
     Some(Plan {
-        to_summarize,
-        turn_prefix,
-        previous_summary,
+        messages,
+        splits_turn,
         first_kept_entry_id: body.get(cut).and_then(|i| i.entry_id.clone()),
-        tokens_before: estimate_context_tokens(&messages),
+        tokens_before,
         read_files,
         modified_files,
     })
+}
+
+fn summary_prompt(plan: &Plan, instructions: Option<&str>) -> String {
+    let mut prompt = PROMPT.to_string();
+    if matches!(plan.messages.first(), Some(Message::CompactionSummary(_))) {
+        prompt.push_str(&format!("\n\n{PREVIOUS_SUMMARY}"));
+    }
+    prompt.push_str(&format!("\n\nUse this format:\n\n{SUMMARY_FORMAT}"));
+    if plan.splits_turn {
+        prompt.push_str(&format!("\n\n{SPLIT_TURN}"));
+    }
+    if let Some(instructions) = instructions.map(str::trim).filter(|i| !i.is_empty()) {
+        prompt.push_str(&format!("\n\nAdditional focus for this checkpoint: {instructions}"));
+    }
+    prompt.push_str(&format!("\n\n{TEXT_ONLY}"));
+    prompt
 }
 
 fn truncate_chars(text: &str, max: usize) -> String {
@@ -220,126 +221,35 @@ fn truncate_chars(text: &str, max: usize) -> String {
     }
 }
 
-/// Render messages as plain text so the summarizer does not treat them as a live conversation.
-pub fn serialize_conversation(messages: &[Message]) -> String {
-    let mut parts = Vec::new();
-    for message in messages {
+/// `messages` with tool and command output shortened. The edit breaks the prefix their thinking
+/// blocks were produced with, so those are removed too.
+fn condense(messages: &[Message]) -> Vec<Message> {
+    let mut messages = messages.to_vec();
+    for message in &mut messages {
         match message {
-            Message::User(user) => {
-                let text = content_text(&user.content);
-                if !text.is_empty() {
-                    parts.push(format!("[User]: {text}"));
-                }
-            }
-            Message::Assistant(assistant) => {
-                let thinking: Vec<&str> = assistant
-                    .content
-                    .iter()
-                    .filter_map(|b| match b {
-                        ContentBlock::Thinking { thinking, redacted: false, .. } if !thinking.is_empty() => {
-                            Some(thinking.as_str())
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                if !thinking.is_empty() {
-                    parts.push(format!("[Assistant thinking]: {}", thinking.join("\n")));
-                }
-                let text = assistant.text();
-                if !text.is_empty() {
-                    parts.push(format!("[Assistant]: {text}"));
-                }
-                let calls: Vec<String> = assistant
-                    .tool_calls()
-                    .map(|call| {
-                        let args = match call.arguments {
-                            Value::Object(map) => {
-                                map.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(", ")
-                            }
-                            other => other.to_string(),
-                        };
-                        format!("{}({args})", call.name)
-                    })
-                    .collect();
-                if !calls.is_empty() {
-                    parts.push(format!("[Assistant tool calls]: {}", calls.join("; ")));
-                }
-            }
+            Message::Assistant(assistant) => assistant.remove_thinking(),
             Message::ToolResult(result) => {
-                let text = content_text(&result.content);
-                if !text.is_empty() {
-                    parts.push(format!("[Tool result]: {}", truncate_chars(&text, TOOL_RESULT_MAX_CHARS)));
+                for block in &mut result.content {
+                    if let ContentBlock::Text { text } = block {
+                        *text = truncate_chars(text, CONDENSED_OUTPUT_CHARS);
+                    }
                 }
             }
-            Message::BashExecution(bash) if !bash.exclude_from_context => {
-                parts.push(format!(
-                    "[User ran command]: {}",
-                    truncate_chars(&bash.to_context_text(), TOOL_RESULT_MAX_CHARS)
-                ));
-            }
-            Message::BashExecution(_) => {}
-            Message::CompactionSummary(summary) => parts.push(format!("[Earlier summary]: {}", summary.summary)),
+            Message::BashExecution(bash) => bash.output = truncate_chars(&bash.output, CONDENSED_OUTPUT_CHARS),
+            Message::User(_) | Message::CompactionSummary(_) => {}
         }
     }
-    parts.join("\n\n")
+    messages
 }
 
-fn focus(instructions: Option<&str>) -> String {
-    match instructions.map(str::trim).filter(|i| !i.is_empty()) {
-        Some(instructions) => format!("\n\nAdditional focus for this summary: {instructions}"),
-        None => String::new(),
-    }
-}
-
-fn summarization_prompt(plan: &Plan, instructions: Option<&str>) -> String {
-    let mut prompt = format!("<conversation>\n{}\n</conversation>\n\n", serialize_conversation(&plan.to_summarize));
-    match &plan.previous_summary {
-        Some(previous) => {
-            prompt.push_str(&format!("<previous-summary>\n{previous}\n</previous-summary>\n\n"));
-            prompt.push_str("The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.\n\n");
-            prompt.push_str(UPDATE_RULES);
-            prompt.push_str("\n\nUse this EXACT format:\n\n");
-        }
-        None => {
-            prompt.push_str("The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.\n\nUse this EXACT format:\n\n");
-        }
-    }
-    prompt.push_str(SUMMARY_FORMAT);
-    prompt.push_str(&focus(instructions));
-    prompt
-}
-
-fn turn_prefix_prompt(plan: &Plan, instructions: Option<&str>) -> String {
-    format!(
-        "<conversation>\n{}\n</conversation>\n\n{TURN_PREFIX_PROMPT}{}",
-        serialize_conversation(&plan.turn_prefix),
-        focus(instructions)
-    )
-}
-
-/// Ask `model` for a summary with `prompt`, returning its text and usage.
+/// Stream `request` and return the summary it produced.
 async fn generate(
     client: &reqwest::Client,
-    model: &Model,
-    prompt: String,
-    max_tokens: u64,
+    request: &Request<'_>,
     cancel: &CancellationToken,
 ) -> Result<(String, Usage), ProviderError> {
-    let messages = vec![Message::User(UserMessage::new(vec![ContentBlock::text(prompt)]))];
-    let request = Request {
-        model,
-        system_prompt: SUMMARIZATION_SYSTEM_PROMPT,
-        messages: &messages,
-        tools: &[],
-        // Summaries need little reasoning; use the cheapest level the model supports.
-        thinking: model.clamp_thinking(ThinkingLevel::Off),
-        max_tokens: Some(max_tokens.max(4_096).min(model.max_tokens.max(4_096))),
-        // A summary request shares no prefix with later requests, so a cache entry would only
-        // cost more.
-        cache_retention: None,
-    };
-    let mut response = provider::new_assistant_message(model, request.thinking);
-    provider::stream(client, &request, &mut response, &mut |_, _| {}, cancel).await?;
+    let mut response = provider::new_assistant_message(request.model, request.thinking);
+    provider::stream(client, request, &mut response, &mut |_, _| {}, cancel).await?;
     match response.stop_reason {
         StopReason::Error => {
             return Err(ProviderError::fatal(format!(
@@ -354,6 +264,11 @@ async fn generate(
         }
         _ => {}
     }
+    if response.tool_calls().next().is_some() {
+        return Err(ProviderError::fatal(
+            "Summarization failed: the model called a tool instead of writing the summary",
+        ));
+    }
     let text = response.text().trim().to_string();
     if text.is_empty() {
         return Err(ProviderError::fatal("Summarization returned no text"));
@@ -361,45 +276,25 @@ async fn generate(
     Ok((text, response.usage))
 }
 
-/// Generate the summary for `plan` with `model`.
+/// Summarize `plan` by repeating `conversation`, the conversation's request for `plan.messages`,
+/// with the summary prompt appended.
 pub async fn summarize(
     client: &reqwest::Client,
-    model: &Model,
+    conversation: Request<'_>,
     plan: &Plan,
     instructions: Option<&str>,
-    reserve_tokens: u64,
     cancel: &CancellationToken,
 ) -> Result<CompactionResult, ProviderError> {
-    // The history and the beginning of a split turn are summarized concurrently.
-    let history = async {
-        if plan.to_summarize.is_empty() {
-            return Ok(None);
+    let mut messages = conversation.messages.to_vec();
+    messages.push(Message::User(UserMessage::new(vec![ContentBlock::text(summary_prompt(plan, instructions))])));
+    let request = Request { messages: &messages, max_tokens: None, ..conversation };
+    let (mut summary, usage) = match generate(client, &request, cancel).await {
+        // The summarized messages alone can overflow, such as after a huge tool result.
+        Err(err) if err.kind == ErrorKind::ContextOverflow => {
+            let condensed = condense(&messages);
+            generate(client, &Request { messages: &condensed, ..request }, cancel).await?
         }
-        let prompt = summarization_prompt(plan, instructions);
-        generate(client, model, prompt, reserve_tokens * 4 / 5, cancel).await.map(Some)
-    };
-    let turn = async {
-        if plan.turn_prefix.is_empty() {
-            return Ok(None);
-        }
-        generate(client, model, turn_prefix_prompt(plan, instructions), reserve_tokens / 2, cancel).await.map(Some)
-    };
-    let (history, turn) = tokio::try_join!(history, turn)?;
-
-    let mut usage = Usage::default();
-    let history = match history {
-        Some((text, history_usage)) => {
-            usage.add(&history_usage);
-            text
-        }
-        None => plan.previous_summary.clone().unwrap_or_else(|| "No prior history.".to_string()),
-    };
-    let mut summary = match turn {
-        Some((text, turn_usage)) => {
-            usage.add(&turn_usage);
-            format!("{history}\n\n---\n\n**Turn Context (split turn):**\n\n{text}")
-        }
-        None => history,
+        result => result?,
     };
     if !plan.read_files.is_empty() {
         summary.push_str(&format!(
@@ -455,9 +350,80 @@ mod tests {
         // Each message is ~100 tokens; keeping 150 lands on the tool result, which moves forward.
         let plan = plan(&items, 150, None).unwrap();
         assert_eq!(plan.first_kept_entry_id.as_deref(), Some("d"));
-        assert_eq!(plan.to_summarize.len(), 3);
+        assert_eq!(plan.messages.len(), 3);
         // The kept region starts a turn, so no turn is split.
-        assert!(plan.turn_prefix.is_empty());
+        assert!(!plan.splits_turn);
+    }
+
+    fn assistant(text: &str) -> Message {
+        Message::Assistant(crate::message::AssistantMessage {
+            content: vec![
+                ContentBlock::Thinking { thinking: "hmm".into(), signature: Some("sig".into()), redacted: false },
+                ContentBlock::text(text),
+            ],
+            api: crate::config::Api::AnthropicMessages,
+            provider: "anthropic".into(),
+            model: "m".into(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            thinking_level: None,
+            timestamp: 0,
+            duration_ms: None,
+        })
+    }
+
+    fn summary(text: &str) -> Message {
+        Message::CompactionSummary(crate::message::CompactionSummaryMessage {
+            summary: text.into(),
+            tokens_before: 0,
+            timestamp: 0,
+        })
+    }
+
+    #[test]
+    fn a_cut_at_an_assistant_message_splits_its_turn() {
+        let big = "x".repeat(400);
+        let items = vec![
+            item("a", user(&big)),
+            item("b", assistant(&big)),
+            item("c", user(&big)),
+            item("d", assistant(&big)),
+            item("e", assistant(&big)),
+        ];
+        let plan = plan(&items, 50, None).unwrap();
+        assert_eq!(plan.first_kept_entry_id.as_deref(), Some("e"));
+        assert_eq!(plan.messages.len(), 4);
+        assert!(plan.splits_turn);
+        let prompt = summary_prompt(&plan, Some("tests"));
+        assert!(prompt.contains("## Current Turn") && prompt.contains("focus for this checkpoint: tests"));
+        assert!(!prompt.contains("<summary>"));
+    }
+
+    #[test]
+    fn a_previous_summary_is_merged_and_kept_in_the_request() {
+        let big = "x".repeat(400);
+        let items = vec![
+            ContextItem { entry_id: None, message: summary("S") },
+            item("c", user(&big)),
+            item("d", assistant(&big)),
+            item("e", assistant(&big)),
+        ];
+        let plan = plan(&items, 50, None).unwrap();
+        assert!(matches!(&plan.messages[0], Message::CompactionSummary(s) if s.summary == "S"));
+        assert_eq!(plan.messages.len(), 3);
+        assert!(plan.splits_turn);
+        assert!(summary_prompt(&plan, None).contains("<summary>"));
+    }
+
+    #[test]
+    fn condensing_shortens_tool_output_and_drops_thinking() {
+        let condensed = condense(&[assistant("a"), tool_result(&"y".repeat(5_000))]);
+        let Message::Assistant(assistant) = &condensed[0] else { panic!("expected assistant") };
+        assert_eq!(assistant.content.len(), 1);
+        let Message::ToolResult(result) = &condensed[1] else { panic!("expected tool result") };
+        let text = crate::message::content_text(&result.content);
+        assert!(text.len() < 2_100 && text.ends_with("[... 3000 more characters truncated]"));
     }
 
     #[test]

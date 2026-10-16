@@ -267,7 +267,13 @@ impl SessionStore {
         if first_kept != id
             && let Some(start) = self.entries[..index].iter().position(|e| e.id() == first_kept)
         {
-            items.extend(self.entries[start..index].iter().filter_map(message_item));
+            // The kept messages' thinking was produced with the compacted history before it.
+            items.extend(self.entries[start..index].iter().filter_map(message_item).map(|mut item| {
+                if let Message::Assistant(assistant) = &mut item.message {
+                    assistant.remove_thinking();
+                }
+                item
+            }));
         }
         items.extend(self.entries[index + 1..].iter().filter_map(message_item));
         items
@@ -394,7 +400,7 @@ pub fn most_recent_session(cwd: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::UserMessage;
+    use crate::message::{AssistantMessage, StopReason, UserMessage};
 
     fn user(text: &str) -> Message {
         Message::User(UserMessage::new(vec![ContentBlock::text(text)]))
@@ -449,6 +455,57 @@ mod tests {
         assert!(matches!(&messages[0], Message::CompactionSummary(s) if s.summary == "S"));
         assert!(matches!(&messages[1], Message::User(u) if content_text(&u.content) == "two"));
         assert!(matches!(&messages[2], Message::User(u) if content_text(&u.content) == "three"));
+    }
+
+    #[test]
+    fn context_drops_thinking_produced_before_the_compaction() {
+        let assistant = |text: &str| {
+            Message::Assistant(AssistantMessage {
+                content: vec![
+                    ContentBlock::Thinking { thinking: "hmm".into(), signature: Some("sig".into()), redacted: false },
+                    ContentBlock::text(text),
+                ],
+                api: crate::config::Api::AnthropicMessages,
+                provider: "anthropic".into(),
+                model: "m".into(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                thinking_level: None,
+                timestamp: 0,
+                duration_ms: None,
+            })
+        };
+        let mut store = in_memory();
+        store.append_message(user("one")).unwrap();
+        let kept = store.append_message(user("two")).unwrap();
+        store.append_message(assistant("kept")).unwrap();
+        store
+            .append(Entry::Compaction {
+                id: new_entry_id(),
+                timestamp: iso_now(),
+                summary: "S".into(),
+                first_kept_entry_id: kept,
+                tokens_before: 10,
+                details: None,
+                usage: None,
+            })
+            .unwrap();
+        store.append_message(user("three")).unwrap();
+        store.append_message(assistant("new")).unwrap();
+        let blocks = |message: &Message| match message {
+            Message::Assistant(a) => a.content.len(),
+            _ => panic!("expected assistant message"),
+        };
+        let messages = store.messages();
+        assert_eq!(messages.len(), 5);
+        assert_eq!(blocks(&messages[2]), 1);
+        assert_eq!(blocks(&messages[4]), 2);
+        // The session file keeps the full message.
+        assert_eq!(
+            store.all_messages().filter(|m| matches!(m, Message::Assistant(a) if a.content.len() == 2)).count(),
+            2
+        );
     }
 
     #[test]

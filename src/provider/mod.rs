@@ -25,6 +25,7 @@ pub struct ToolSpec {
     pub parameters: Value,
 }
 
+#[derive(Clone, Copy)]
 pub struct Request<'a> {
     pub model: &'a Model,
     pub system_prompt: &'a str,

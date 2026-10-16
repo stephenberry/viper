@@ -156,6 +156,12 @@ pub struct AssistantMessage {
 }
 
 impl AssistantMessage {
+    /// Drop the thinking blocks, keeping text and tool calls. A provider accepts a thinking block
+    /// only after the exact conversation it was produced with.
+    pub fn remove_thinking(&mut self) {
+        self.content.retain(|block| !matches!(block, ContentBlock::Thinking { .. }));
+    }
+
     pub fn tool_calls(&self) -> impl Iterator<Item = ToolCallRef<'_>> {
         self.content.iter().filter_map(|block| match block {
             ContentBlock::ToolCall { id, name, arguments, invalid_arguments } => {

@@ -12,7 +12,6 @@ use crate::config::{CacheRetention, Model, Reasoning, ThinkingLevel};
 use crate::message::{AssistantMessage, ContentBlock, Message, StopReason};
 
 pub(super) const API_VERSION: &str = "2023-06-01";
-const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 
 fn effort(level: ThinkingLevel) -> &'static str {
     match level {
@@ -21,17 +20,6 @@ fn effort(level: ThinkingLevel) -> &'static str {
         ThinkingLevel::High => "high",
         ThinkingLevel::Xhigh => "xhigh",
         ThinkingLevel::Max => "max",
-    }
-}
-
-fn thinking_budget(level: ThinkingLevel) -> u64 {
-    match level {
-        ThinkingLevel::Off => 0,
-        ThinkingLevel::Minimal => 1_024,
-        ThinkingLevel::Low => 4_096,
-        ThinkingLevel::Medium => 10_240,
-        ThinkingLevel::High => 20_480,
-        ThinkingLevel::Xhigh | ThinkingLevel::Max => 32_000,
     }
 }
 
@@ -152,10 +140,8 @@ fn add_cache_breakpoints(messages: &mut [Value], cache_control: &Value) {
     }
 }
 
-pub(super) fn build_body(request: &Request<'_>) -> (Value, Vec<&'static str>) {
+pub(super) fn build_body(request: &Request<'_>) -> Value {
     let model = request.model;
-    let mut betas = Vec::new();
-    let mut max_tokens = request.max_tokens.unwrap_or(model.max_tokens);
     let mut body = Map::new();
     body.insert("model".into(), json!(model.id));
     body.insert("stream".into(), json!(true));
@@ -192,28 +178,19 @@ pub(super) fn build_body(request: &Request<'_>) -> (Value, Vec<&'static str>) {
     }
 
     let level = model.clamp_thinking(request.thinking);
-    match model.reasoning {
-        Reasoning::Adaptive => {
-            if level == ThinkingLevel::Off {
-                body.insert("thinking".into(), json!({"type": "disabled"}));
-            } else {
-                body.insert("thinking".into(), json!({"type": "adaptive", "display": "summarized"}));
-                body.insert("output_config".into(), json!({"effort": effort(level)}));
-            }
+    if model.reasoning == Reasoning::Adaptive {
+        if level == ThinkingLevel::Off {
+            body.insert("thinking".into(), json!({"type": "disabled"}));
+        } else {
+            body.insert("thinking".into(), json!({"type": "adaptive", "display": "summarized"}));
+            body.insert("output_config".into(), json!({"effort": effort(level)}));
         }
-        Reasoning::Budget if level != ThinkingLevel::Off => {
-            let budget = thinking_budget(level);
-            max_tokens = max_tokens.max(budget + 4_096);
-            body.insert("thinking".into(), json!({"type": "enabled", "budget_tokens": budget}));
-            betas.push(INTERLEAVED_THINKING_BETA);
-        }
-        _ => {}
     }
-    body.insert("max_tokens".into(), json!(max_tokens));
+    body.insert("max_tokens".into(), json!(request.max_tokens.unwrap_or(model.max_tokens)));
 
     let mut body = Value::Object(body);
     merge_extra_body(&mut body, model);
-    (body, betas)
+    body
 }
 
 fn map_stop_reason(reason: &str, out: &mut AssistantMessage, stop_details: Option<&Value>) {
@@ -405,12 +382,9 @@ pub(super) async fn stream(
     on_delta: &mut DeltaSink<'_>,
     cancel: &CancellationToken,
 ) -> Result<(), ProviderError> {
-    let (body, betas) = build_body(request);
-    let mut builder =
+    let body = build_body(request);
+    let builder =
         client.post(v1_url(&request.model.base_url, "messages")).header("accept", "text/event-stream").json(&body);
-    if !betas.is_empty() {
-        builder = builder.header("anthropic-beta", betas.join(","));
-    }
     let builder = apply_auth(builder, request.model, api_key)?;
     let response = send(builder, cancel).await?;
 
@@ -466,8 +440,7 @@ mod tests {
             max_tokens: None,
             cache_retention: Some(CacheRetention::Short),
         };
-        let (body, betas) = build_body(&request);
-        assert!(betas.is_empty());
+        let body = build_body(&request);
         // Opus 5.5 cannot disable thinking, so "off" clamps to low effort.
         assert_eq!(body["thinking"], json!({"type": "adaptive", "display": "summarized"}));
         assert_eq!(body["output_config"], json!({"effort": "low"}));
@@ -494,14 +467,14 @@ mod tests {
             max_tokens: None,
             cache_retention: Some(CacheRetention::Long),
         };
-        let (body, _) = build_body(&request);
+        let body = build_body(&request);
         let marker = json!({"type": "ephemeral", "ttl": "1h"});
         assert_eq!(body["messages"][0]["content"][0]["cache_control"], marker);
         assert_eq!(body["messages"][2]["content"][24]["cache_control"], marker);
         assert_eq!(body.to_string().matches("cache_control").count(), 3);
 
         request.cache_retention = None;
-        let (body, _) = build_body(&request);
+        let body = build_body(&request);
         assert!(!body.to_string().contains("cache_control"));
     }
 
@@ -583,7 +556,7 @@ mod tests {
             max_tokens: None,
             cache_retention: Some(CacheRetention::Long),
         };
-        let (body, _) = build_body(&request);
+        let body = build_body(&request);
         let marker = json!({"type": "ephemeral", "ttl": "1h"});
         assert_eq!(body["system"][0]["cache_control"], marker);
         assert_eq!(body["messages"][0]["content"][0]["cache_control"], marker);
