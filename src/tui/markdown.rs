@@ -1,17 +1,79 @@
 //! Line-by-line Markdown styling for streamed assistant text.
 //!
 //! Each completed line is styled once and never re-rendered, so output can go straight to
-//! scrollback while the response streams. Block state (code fences) carries across lines.
+//! scrollback while the response streams. Block state (code fences) carries across lines. Tables
+//! are the exception: their column widths depend on every row, so rows are held back until the
+//! table ends and are shown meanwhile by [`MarkdownRenderer::preview`].
 
 use super::style::*;
+use super::table::{self, Table};
 
 #[derive(Default)]
 pub struct MarkdownRenderer {
     in_code: bool,
+    held: Held,
+}
+
+/// Lines held back while a table may be forming.
+#[derive(Default)]
+enum Held {
+    #[default]
+    Nothing,
+    /// A line that may be a table's header row, held until the next line shows whether it is.
+    Header(String),
+    /// The table whose rows are arriving.
+    Table(Table),
 }
 
 impl MarkdownRenderer {
-    pub fn render_line(&mut self, line: &str) -> String {
+    /// Render a completed line into the lines now ready for scrollback: none while a table is
+    /// being collected, and the whole table, fitted to `width` columns, once it ends.
+    pub fn render_line(&mut self, line: &str, width: usize) -> Vec<String> {
+        if let Held::Table(table) = &mut self.held
+            && table.push_row(line)
+        {
+            return Vec::new();
+        }
+        if let Held::Header(header) = &self.held
+            && let Some(table) = Table::start(header, line)
+        {
+            self.held = Held::Table(table);
+            return Vec::new();
+        }
+        let mut out = self.finish(width);
+        if !self.in_code && table::is_row(line) {
+            self.held = Held::Header(line.to_string());
+        } else {
+            out.push(self.style_line(line));
+        }
+        out
+    }
+
+    /// Release the lines still held back, once the text has ended.
+    pub fn finish(&mut self, width: usize) -> Vec<String> {
+        match std::mem::take(&mut self.held) {
+            Held::Nothing => Vec::new(),
+            Held::Header(header) => vec![self.style_line(&header)],
+            Held::Table(table) => table.render(width),
+        }
+    }
+
+    /// Lines showing what is held back plus the partial (still streaming) `line`, without
+    /// advancing block state.
+    pub fn preview(&self, line: &str, width: usize) -> Vec<String> {
+        let mut out = match &self.held {
+            Held::Nothing => Vec::new(),
+            Held::Header(header) => vec![inline(header, "")],
+            Held::Table(table) => table.render(width),
+        };
+        if !line.is_empty() {
+            out.push(if self.in_code { paint(CYAN, line) } else { line.to_string() });
+        }
+        out
+    }
+
+    /// Style one line outside any table.
+    fn style_line(&mut self, line: &str) -> String {
         let trimmed = line.trim_start();
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             self.in_code = !self.in_code;
@@ -56,11 +118,6 @@ impl MarkdownRenderer {
             return format!("{indent}{CYAN}{number}.{RESET} {}", inline(rest, ""));
         }
         format!("{indent}{}", inline(trimmed, ""))
-    }
-
-    /// Style a partial (still streaming) line without advancing block state.
-    pub fn preview_line(&self, line: &str) -> String {
-        if self.in_code { paint(CYAN, line) } else { line.to_string() }
     }
 }
 
@@ -175,13 +232,38 @@ mod tests {
     #[test]
     fn styles_blocks() {
         let mut md = MarkdownRenderer::default();
-        assert_eq!(plain(&md.render_line("## Title")), "Title");
-        assert_eq!(plain(&md.render_line("- item")), "• item");
-        assert_eq!(plain(&md.render_line("12. step")), "12. step");
-        md.render_line("```rust");
-        assert_eq!(md.render_line("- not a list"), paint(CYAN, "- not a list"));
-        md.render_line("```");
-        assert_eq!(plain(&md.render_line("- list")), "• list");
+        let mut render = |line: &str| md.render_line(line, 80).iter().map(|l| plain(l)).collect::<Vec<_>>();
+        assert_eq!(render("## Title"), ["Title"]);
+        assert_eq!(render("- item"), ["• item"]);
+        assert_eq!(render("12. step"), ["12. step"]);
+        render("```rust");
+        assert_eq!(md.render_line("- not a list", 80), [paint(CYAN, "- not a list")]);
+        md.render_line("```", 80);
+        assert_eq!(plain(&md.render_line("- list", 80)[0]), "• list");
+    }
+
+    #[test]
+    fn holds_table_rows_until_the_table_ends() {
+        let mut md = MarkdownRenderer::default();
+        assert!(md.render_line("| a | b |", 80).is_empty());
+        assert_eq!(plain(&md.preview("", 80)[0]), "| a | b |");
+        assert!(md.render_line("|---|---|", 80).is_empty());
+        assert!(md.render_line("| 1 | 2 |", 80).is_empty());
+        assert_eq!(md.preview("| 3", 80).len(), 6);
+        let lines: Vec<String> = md.render_line("after", 80).iter().map(|l| plain(l)).collect();
+        assert_eq!(lines, ["┌───┬───┐", "│ a │ b │", "├───┼───┤", "│ 1 │ 2 │", "└───┴───┘", "after"]);
+        assert!(md.finish(80).is_empty());
+    }
+
+    #[test]
+    fn releases_a_row_that_starts_no_table() {
+        let mut md = MarkdownRenderer::default();
+        assert!(md.render_line("| not a table", 80).is_empty());
+        assert_eq!(md.render_line("text", 80).iter().map(|l| plain(l)).collect::<Vec<_>>(), ["| not a table", "text"]);
+        assert!(md.render_line("| held", 80).is_empty());
+        assert_eq!(plain(&md.finish(80)[0]), "| held");
+        md.render_line("```", 80);
+        assert_eq!(md.render_line("| code |", 80).len(), 1);
     }
 
     #[test]

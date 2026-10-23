@@ -10,6 +10,7 @@ mod prompt;
 mod render;
 mod select;
 mod style;
+mod table;
 mod terminal;
 mod text;
 
@@ -547,8 +548,10 @@ impl App {
 
         for block in self.blocks.values() {
             match block.kind {
-                StreamKind::Text if !block.partial.is_empty() => {
-                    push_wrapped(&mut lines, Line::plain(block.markdown.preview_line(&sanitize(&block.partial))));
+                StreamKind::Text => {
+                    for line in block.markdown.preview(&sanitize(&block.partial), width) {
+                        push_wrapped(&mut lines, Line::plain(line));
+                    }
                 }
                 StreamKind::Thinking if self.hide_thinking && block.had_content => {
                     lines.push(render::hidden_thinking());
@@ -730,6 +733,10 @@ impl App {
             let line = std::mem::take(&mut block.partial);
             self.emit_block_line(&mut block, &line);
         }
+        let held: Vec<Line> = block.markdown.finish(self.width()).into_iter().map(Line::plain).collect();
+        if !held.is_empty() {
+            self.commit_block(&mut block, held);
+        }
         if matches!(block.kind, StreamKind::Thinking) && self.hide_thinking && block.had_content {
             self.gap();
             self.commit(vec![Line::plain(render::hidden_thinking())]);
@@ -743,15 +750,20 @@ impl App {
         }
         block.had_content = true;
         let rendered = match block.kind {
-            StreamKind::Text => Line::plain(block.markdown.render_line(&line)),
+            StreamKind::Text => block.markdown.render_line(&line, self.width()).into_iter().map(Line::plain).collect(),
             StreamKind::Thinking if self.hide_thinking => return,
-            StreamKind::Thinking => Line::indented(format!("{GRAY}{ITALIC}{line}{RESET}"), "  ", "  "),
+            StreamKind::Thinking => vec![Line::indented(format!("{GRAY}{ITALIC}{line}{RESET}"), "  ", "  ")],
         };
+        self.commit_block(block, rendered);
+    }
+
+    /// Commit a streamed block's lines, setting the block apart from what precedes it.
+    fn commit_block(&mut self, block: &mut StreamBlock, lines: Vec<Line>) {
         if !block.started {
             block.started = true;
             self.gap();
         }
-        self.commit(vec![rendered]);
+        self.commit(lines);
     }
 
     fn on_delta(&mut self, delta: StreamDelta) {
@@ -1951,8 +1963,12 @@ impl App {
                 for warning in warnings {
                     self.error(&warning);
                 }
-                let lines =
-                    render::transcript_lines(&self.agent.session_messages(), self.hide_thinking, self.tool_max_lines());
+                let lines = render::transcript_lines(
+                    &self.agent.session_messages(),
+                    self.hide_thinking,
+                    self.tool_max_lines(),
+                    self.width(),
+                );
                 self.commit(lines);
                 self.refresh_footer();
             }
@@ -2043,7 +2059,7 @@ pub async fn run(
     app.welcome(&warnings);
     let history = agent.session_messages();
     if !history.is_empty() {
-        let lines = render::transcript_lines(&history, app.hide_thinking, app.tool_max_lines());
+        let lines = render::transcript_lines(&history, app.hide_thinking, app.tool_max_lines(), app.width());
         app.commit(lines);
         app.notice("Resumed session.");
     }

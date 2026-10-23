@@ -98,9 +98,12 @@ pub fn thinking_lines(text: &str) -> Vec<Line> {
     text.lines().map(|l| Line::indented(format!("{GRAY}{ITALIC}{}{RESET}", sanitize(l)), "  ", "  ")).collect()
 }
 
-pub fn markdown_lines(text: &str) -> Vec<Line> {
+/// Styled lines for complete Markdown `text`, with tables fitted to `width` columns.
+pub fn markdown_lines(text: &str, width: usize) -> Vec<Line> {
     let mut md = MarkdownRenderer::default();
-    text.lines().map(|l| Line::plain(md.render_line(&sanitize(l)))).collect()
+    let mut lines: Vec<String> = text.lines().flat_map(|l| md.render_line(&sanitize(l), width)).collect();
+    lines.extend(md.finish(width));
+    lines.into_iter().map(Line::plain).collect()
 }
 
 fn first_line(s: &str) -> &str {
@@ -279,13 +282,13 @@ pub fn notice_line(text: &str) -> Line {
 }
 
 /// Lines for a whole assistant message (used when replaying a session).
-pub fn assistant_lines(message: &AssistantMessage, hide_thinking: bool) -> Vec<Line> {
+pub fn assistant_lines(message: &AssistantMessage, hide_thinking: bool, width: usize) -> Vec<Line> {
     let mut lines = Vec::new();
     for block in &message.content {
         match block {
             ContentBlock::Text { text } if !text.trim().is_empty() => {
                 lines.push(Line::plain(""));
-                lines.extend(markdown_lines(text.trim_end()));
+                lines.extend(markdown_lines(text.trim_end(), width));
             }
             ContentBlock::Thinking { thinking, redacted, .. } if !thinking.trim().is_empty() => {
                 lines.push(Line::plain(""));
@@ -308,7 +311,7 @@ pub fn assistant_lines(message: &AssistantMessage, hide_thinking: bool) -> Vec<L
 }
 
 /// Render a saved conversation for display after resuming.
-pub fn transcript_lines(messages: &[Message], hide_thinking: bool, max_tool_lines: usize) -> Vec<Line> {
+pub fn transcript_lines(messages: &[Message], hide_thinking: bool, max_tool_lines: usize, width: usize) -> Vec<Line> {
     let mut lines = Vec::new();
     let mut calls: std::collections::HashMap<String, (String, Value)> = Default::default();
     for message in messages {
@@ -321,7 +324,7 @@ pub fn transcript_lines(messages: &[Message], hide_thinking: bool, max_tool_line
                 for call in assistant.tool_calls() {
                     calls.insert(call.id.to_string(), (call.name.to_string(), call.arguments.clone()));
                 }
-                lines.extend(assistant_lines(assistant, hide_thinking));
+                lines.extend(assistant_lines(assistant, hide_thinking, width));
             }
             Message::ToolResult(result) => {
                 let (name, args) =
