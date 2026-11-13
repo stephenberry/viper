@@ -76,7 +76,31 @@ Output goes to your terminal's normal scrollback, so scrolling and copying work 
 | Ctrl+V | Paste an image (or drag an image file in) |
 | Ctrl+P | Expand a large paste, which is shown collapsed as `[pasted N lines]` |
 
-Type `!command` to run a shell command and share its output with the model, or `!!command` to run it without sharing. Type `/help` for slash commands such as `/model`, `/resume`, `/compact`, and `/login`.
+Type `!command` to run a shell command and share its output with the model, or `!!command` to run it without sharing.
+
+### Slash commands
+
+| Command | What it does |
+|---|---|
+| `/model [query]` | Pick a model, or switch straight to one matching `query` |
+| `/thinking [level]` | Pick a thinking level, or set one directly |
+| `/new` | Start a new session |
+| `/resume` | Pick a saved session to resume |
+| `/session` | Show the session's file, message counts, context size, tokens, and cost |
+| `/name <name>` | Name the session |
+| `/compact [focus]` | Compact the context now, optionally telling the summary what to focus on |
+| `/autocompact <size>\|auto\|off\|on` | Set when auto-compaction runs for the current model, such as `/autocompact 300k` |
+| `/cache long\|short` | Keep the prompt cache for an hour (`long`, the default) or 5 minutes (`short`); `1h` and `5m` also work. Bare `/cache` shows the current setting |
+| `/budget [provider]` | Show a provider's spend and remaining budget (by default the current model's provider) |
+| `/login <provider>` | Save a provider's base URL and API key |
+| `/sync-models <provider>` | Add a provider's new server models to `models.json` |
+| `/skill:name` | Load a skill explicitly |
+| `/copy` | Copy the last response to the clipboard |
+| `/hotkeys` | Show keyboard shortcuts |
+| `/help` | Show commands |
+| `/quit` | Exit viper |
+
+`/model`, `/thinking`, `/autocompact`, and `/cache` save your choice to the global settings.
 
 ## Instructions and skills
 
