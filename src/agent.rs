@@ -415,6 +415,18 @@ impl Agent {
         if last.provider != model.provider || last.model != model.id {
             return None;
         }
+        // A compaction since `last` replaced the history its request cached: the next message
+        // writes the compacted context however soon it is sent, so waiting has cost nothing.
+        // `last` may be a kept message that survived the compaction, so the session's entry
+        // order decides, not timestamps.
+        let compacted_since_last = state.session.entries().iter().rev().find_map(|entry| match entry {
+            Entry::Compaction { .. } => Some(true),
+            Entry::Message { message: Message::Assistant(_), .. } => Some(false),
+            _ => None,
+        });
+        if compacted_since_last == Some(true) {
+            return None;
+        }
         // The request that produced `last` used the cache when it started, at its timestamp.
         let idle = Duration::from_millis(u64::try_from(now_ms() - last.timestamp).unwrap_or(0));
         let retention = prompt_cache::applied_retention(state.cache_retention, &last.usage);
@@ -1367,6 +1379,73 @@ mod tests {
         assert_eq!(requests[0]["system"][0]["cache_control"], json!({"type": "ephemeral", "ttl": "1h"}));
         assert_eq!(requests[1]["system"][0]["cache_control"], json!({"type": "ephemeral"}));
         assert_eq!(requests[1]["messages"][2]["content"][0]["cache_control"], json!({"type": "ephemeral"}));
+    }
+
+    #[test]
+    fn compaction_clears_the_stale_cache_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = model("http://unused", Api::AnthropicMessages);
+        let (agent, _events) = agent(model.clone(), dir.path());
+        let hour = 60 * 60 * 1000;
+        let now = now_ms();
+        let user = |timestamp| {
+            Message::User(UserMessage {
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+                pastes: Vec::new(),
+                timestamp,
+            })
+        };
+        let assistant = |timestamp, cache_read| {
+            Message::Assistant(AssistantMessage {
+                content: vec![ContentBlock::Text { text: "hello".into() }],
+                api: model.api,
+                provider: model.provider.clone(),
+                model: model.id.clone(),
+                usage: Usage { cache_read, ..Default::default() },
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                thinking_level: None,
+                timestamp,
+                duration_ms: None,
+            })
+        };
+        let record = |message: Message| {
+            let mut state = agent.state();
+            let id = state.session.append_message(message).unwrap();
+            state.messages = state.session.messages();
+            id
+        };
+
+        let first_kept = record(user(now - 5 * hour));
+        record(assistant(now - 4 * hour, 400_000));
+        assert!(agent.stale_cache().is_some());
+
+        // The compaction keeps the last exchange, whose usage describes the history before it.
+        {
+            let mut state = agent.state();
+            let id = new_entry_id();
+            state
+                .session
+                .append(Entry::Compaction {
+                    id,
+                    timestamp: crate::time::rfc3339_ms(now - 3 * hour),
+                    summary: "S".into(),
+                    first_kept_entry_id: first_kept,
+                    tokens_before: 400_000,
+                    details: None,
+                    usage: None,
+                })
+                .unwrap();
+            state.messages = state.session.messages();
+            assert_eq!(roles(&state.messages), ["summary", "user", "assistant"]);
+        }
+        assert_eq!(agent.stale_cache(), None);
+
+        // A request after the compaction cached the compacted context again, even one sent in the
+        // same millisecond as the compaction was recorded (auto-compaction before a request).
+        record(user(now - 3 * hour));
+        record(assistant(now - 3 * hour, 300_000));
+        assert!(agent.stale_cache().is_some_and(|stale| stale.tokens == 300_000));
     }
 
     #[tokio::test]
